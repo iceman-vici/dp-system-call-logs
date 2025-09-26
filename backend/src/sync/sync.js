@@ -307,6 +307,43 @@ class DialpadClient {
       throw error;
     }
   }
+  
+  async createRecordingShareLink(recordingId, recordingType = 'admincallrecording') {
+    try {
+      logger.info({
+        recordingId,
+        recordingType
+      }, 'Creating recording share link');
+      
+      const response = await this.axios.post('/api/v2/recordingsharelink', {
+        recording_id: recordingId,
+        recording_type: recordingType,
+        privacy: 'public'
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${config.dialpad.apiKey}`
+        }
+      });
+      
+      const accessLink = response.data?.access_link || response.data?.url || null;
+      
+      logger.info({
+        recordingId,
+        hasLink: !!accessLink
+      }, 'Recording share link created');
+      
+      return accessLink;
+    } catch (error) {
+      logger.error({
+        recordingId,
+        error: error.message,
+        errorData: error.response?.data
+      }, 'Failed to create recording share link');
+      return null;
+    }
+  }
 }
 
 // Airtable API client
@@ -811,8 +848,8 @@ async function sync() {
     const maxPages = 200; // Safety limit
 
     // Track latest connected OUTBOUND call per phone number for secondary base updates
-    // Now also storing duration and recording URL
-    const latestOutboundCalls = new Map(); // phoneNumber -> {dateConnected, duration, recordingUrl}
+    // Now also storing duration and recording details
+    const latestOutboundCalls = new Map(); // phoneNumber -> {dateConnected, duration, recordingId, recordingDetails}
 
     do {
       pageCount++;
@@ -855,9 +892,22 @@ async function sync() {
         const direction = call.direction;
         const wasConnected = !!connectedTime; // True if call was answered
         
-        // Get recording URL
+        // Get recording details
         let recordingUrl = null;
-        if (call.recording_url && call.recording_url.length > 0) {
+        let recordingId = null;
+        
+        // Check for recording_details first (preferred source)
+        if (call.recording_details && Array.isArray(call.recording_details) && call.recording_details.length > 0) {
+          const recordingDetail = call.recording_details[0];
+          recordingId = recordingDetail.id;
+          logger.debug({
+            callId,
+            recordingId,
+            source: 'recording_details'
+          }, 'Found recording ID from recording_details');
+        } 
+        // Fallback to legacy recording URL fields for display in primary base
+        else if (call.recording_url && call.recording_url.length > 0) {
           recordingUrl = call.recording_url[0];
         } else if (call.admin_recording_urls && call.admin_recording_urls.length > 0) {
           recordingUrl = call.admin_recording_urls[0];
@@ -871,7 +921,7 @@ async function sync() {
         }
         
         // Track latest connected OUTBOUND call for secondary base update
-        // Now also tracking duration and recording URL
+        // Now also tracking recording ID for share link generation
         if (direction === 'outbound' && wasConnected && externalNumber) {
           const dateConnectedISO = new Date(connectedTime).toISOString();
           const existing = latestOutboundCalls.get(externalNumber);
@@ -881,7 +931,8 @@ async function sync() {
             latestOutboundCalls.set(externalNumber, {
               dateConnected: dateConnectedISO,
               duration: duration, // Duration in seconds
-              recordingUrl: recordingUrl // May be null
+              recordingId: recordingId, // Recording ID for share link
+              recordingDetails: call.recording_details // Keep full details for reference
             });
             logger.info({
               direction,
@@ -890,7 +941,7 @@ async function sync() {
               dateConnected: dateConnectedISO,
               duration: duration,
               durationFormatted: formatDurationToMMSS(duration),
-              hasRecording: !!recordingUrl,
+              hasRecordingId: !!recordingId,
               action: 'Tracking for secondary base update (OUTBOUND)'
             }, 'Connected outbound call tracked with details');
           }
@@ -904,7 +955,7 @@ async function sync() {
           'Call ID': callId,
           'Direction': direction === 'inbound' ? 'Inbound' : 'Outbound',
           'Start Time': new Date(startTime).toISOString(),
-          'Date Connected': connectedTime ? new Date(connectedTime).toISOString() : null, // NEW FIELD - ADD THIS TO AIRTABLE
+          'Date Connected': connectedTime ? new Date(connectedTime).toISOString() : null,
           'End Time': endTime ? new Date(endTime).toISOString() : null,
           'Duration (s)': duration,
           'Contact Name': call.contact?.name || 'Unknown',
@@ -913,7 +964,7 @@ async function sync() {
           'MOS Score': call.mos_score || null
         };
 
-        // Add recording URL if available
+        // Add recording URL if available (for primary base)
         if (recordingUrl) {
           callRecord['Recording URL'] = recordingUrl;
         }
@@ -936,7 +987,8 @@ async function sync() {
               date_started: call.date_started,
               date_connected: call.date_connected,
               date_ended: call.date_ended,
-              wasConnected: wasConnected
+              wasConnected: wasConnected,
+              recording_details: call.recording_details
             }
           }, 'First call record to be upserted');
         }
@@ -983,25 +1035,36 @@ async function sync() {
       for (const [phoneNumber, callData] of latestOutboundCalls) {
         try {
           const durationFormatted = formatDurationToMMSS(callData.duration);
+          let shareLink = null;
+          
+          // Create share link if recording ID exists
+          if (callData.recordingId) {
+            shareLink = await dialpad.createRecordingShareLink(callData.recordingId);
+            logger.info({
+              phoneNumber,
+              recordingId: callData.recordingId,
+              hasShareLink: !!shareLink
+            }, 'Created recording share link');
+          }
           
           logger.info({
             phoneNumber,
             dateConnected: callData.dateConnected,
             duration: callData.duration,
             durationFormatted,
-            hasRecording: !!callData.recordingUrl
+            hasRecording: !!shareLink
           }, 'Processing update for phone (outbound call with all details)');
           
           // Find record in secondary base by phone number
           const record = await secondaryAirtable.findRecordByPhone(phoneNumber);
           
           if (record) {
-            // Update the last call date, duration, AND recording URL
+            // Update the last call date, duration, AND recording share link
             const updated = await secondaryAirtable.updateCallDetails(
               record.id, 
               callData.dateConnected,
               durationFormatted,
-              callData.recordingUrl
+              shareLink
             );
             
             if (updated) {
@@ -1011,7 +1074,7 @@ async function sync() {
                 recordId: record.id,
                 dateConnected: callData.dateConnected,
                 durationFormatted,
-                hasRecording: !!callData.recordingUrl,
+                hasRecording: !!shareLink,
                 direction: 'outbound',
                 success: true
               }, 'Updated secondary base record with all call details');
