@@ -29,7 +29,8 @@ const config = {
     table: process.env.SECONDARY_AIRTABLE_TABLE,
     phoneField: process.env.SECONDARY_PHONE_FIELD || 'Phone Format',
     lastCallField: process.env.SECONDARY_LAST_CALL_FIELD || 'Dialpad Last Connected Call Date',
-    durationField: process.env.SECONDARY_DURATION_FIELD || 'Dialpad Call Length'
+    durationField: process.env.SECONDARY_DURATION_FIELD || 'Dialpad Call Length',
+    recordingField: process.env.SECONDARY_RECORDING_FIELD || 'DP Connected Last Call Audio'
   },
   fields: {
     customerPhone: process.env.CUSTOMER_PHONE_FIELD || 'Phone',
@@ -125,6 +126,7 @@ function validateConfig() {
       phoneField: config.secondaryAirtable.phoneField,
       lastCallField: config.secondaryAirtable.lastCallField,
       durationField: config.secondaryAirtable.durationField,
+      recordingField: config.secondaryAirtable.recordingField,
       usingSharedPAT: config.secondaryAirtable.pat === config.airtable.pat
     }, 'Secondary Airtable config');
   }
@@ -543,27 +545,36 @@ class SecondaryAirtableClient {
     }
   }
 
-  async updateLastCallDateAndDuration(recordId, dateConnected, durationFormatted) {
+  async updateCallDetails(recordId, dateConnected, durationFormatted, recordingUrl) {
     try {
       logger.info({
         recordId,
         dateConnected,
         durationFormatted,
+        recordingUrl: recordingUrl ? 'present' : 'none',
         fields: {
           lastCallField: config.secondaryAirtable.lastCallField,
-          durationField: config.secondaryAirtable.durationField
+          durationField: config.secondaryAirtable.durationField,
+          recordingField: config.secondaryAirtable.recordingField
         }
-      }, 'Updating last call date and duration in secondary base');
+      }, 'Updating call details in secondary base');
+      
+      const updateFields = {
+        [config.secondaryAirtable.lastCallField]: dateConnected,
+        [config.secondaryAirtable.durationField]: durationFormatted
+      };
+      
+      // Only add recording URL if it exists
+      if (recordingUrl) {
+        updateFields[config.secondaryAirtable.recordingField] = recordingUrl;
+      }
       
       await this.axios.patch(
         `/${encodeURIComponent(config.secondaryAirtable.table)}`,
         {
           records: [{
             id: recordId,
-            fields: {
-              [config.secondaryAirtable.lastCallField]: dateConnected,
-              [config.secondaryAirtable.durationField]: durationFormatted
-            }
+            fields: updateFields
           }]
         }
       );
@@ -571,8 +582,9 @@ class SecondaryAirtableClient {
       logger.info({
         recordId,
         dateConnected,
-        durationFormatted
-      }, 'Successfully updated last call date and duration');
+        durationFormatted,
+        hasRecording: !!recordingUrl
+      }, 'Successfully updated call details');
       
       return true;
     } catch (error) {
@@ -580,7 +592,7 @@ class SecondaryAirtableClient {
         recordId,
         error: error.message,
         errorData: error.response?.data
-      }, 'Failed to update last call date and duration in secondary base');
+      }, 'Failed to update call details in secondary base');
       return false;
     }
   }
@@ -799,8 +811,8 @@ async function sync() {
     const maxPages = 200; // Safety limit
 
     // Track latest connected OUTBOUND call per phone number for secondary base updates
-    // Now also storing duration
-    const latestOutboundCalls = new Map(); // phoneNumber -> {dateConnected, duration}
+    // Now also storing duration and recording URL
+    const latestOutboundCalls = new Map(); // phoneNumber -> {dateConnected, duration, recordingUrl}
 
     do {
       pageCount++;
@@ -843,6 +855,14 @@ async function sync() {
         const direction = call.direction;
         const wasConnected = !!connectedTime; // True if call was answered
         
+        // Get recording URL
+        let recordingUrl = null;
+        if (call.recording_url && call.recording_url.length > 0) {
+          recordingUrl = call.recording_url[0];
+        } else if (call.admin_recording_urls && call.admin_recording_urls.length > 0) {
+          recordingUrl = call.admin_recording_urls[0];
+        }
+        
         // Count connected vs missed calls
         if (wasConnected) {
           connectedCalls++;
@@ -851,7 +871,7 @@ async function sync() {
         }
         
         // Track latest connected OUTBOUND call for secondary base update
-        // Now also tracking duration
+        // Now also tracking duration and recording URL
         if (direction === 'outbound' && wasConnected && externalNumber) {
           const dateConnectedISO = new Date(connectedTime).toISOString();
           const existing = latestOutboundCalls.get(externalNumber);
@@ -860,7 +880,8 @@ async function sync() {
           if (!existing || connectedTime > new Date(existing.dateConnected).getTime()) {
             latestOutboundCalls.set(externalNumber, {
               dateConnected: dateConnectedISO,
-              duration: duration // Duration in seconds
+              duration: duration, // Duration in seconds
+              recordingUrl: recordingUrl // May be null
             });
             logger.info({
               direction,
@@ -869,8 +890,9 @@ async function sync() {
               dateConnected: dateConnectedISO,
               duration: duration,
               durationFormatted: formatDurationToMMSS(duration),
+              hasRecording: !!recordingUrl,
               action: 'Tracking for secondary base update (OUTBOUND)'
-            }, 'Connected outbound call tracked with duration');
+            }, 'Connected outbound call tracked with details');
           }
         }
         
@@ -892,10 +914,8 @@ async function sync() {
         };
 
         // Add recording URL if available
-        if (call.recording_url && call.recording_url.length > 0) {
-          callRecord['Recording URL'] = call.recording_url[0];
-        } else if (call.admin_recording_urls && call.admin_recording_urls.length > 0) {
-          callRecord['Recording URL'] = call.admin_recording_urls[0];
+        if (recordingUrl) {
+          callRecord['Recording URL'] = recordingUrl;
         }
 
         // Match to customer
@@ -952,13 +972,13 @@ async function sync() {
       
     } while (cursor);
 
-    // Update secondary Airtable base with latest connected OUTBOUND calls and durations
+    // Update secondary Airtable base with latest connected OUTBOUND calls and all details
     if (secondaryAirtable && latestOutboundCalls.size > 0) {
       logger.info({
         count: latestOutboundCalls.size,
         phoneNumbers: Array.from(latestOutboundCalls.keys()),
         direction: 'OUTBOUND'
-      }, 'Updating secondary base with latest connected outbound calls and durations');
+      }, 'Updating secondary base with latest connected outbound calls and all details');
       
       for (const [phoneNumber, callData] of latestOutboundCalls) {
         try {
@@ -968,18 +988,20 @@ async function sync() {
             phoneNumber,
             dateConnected: callData.dateConnected,
             duration: callData.duration,
-            durationFormatted
-          }, 'Processing update for phone (outbound call with duration)');
+            durationFormatted,
+            hasRecording: !!callData.recordingUrl
+          }, 'Processing update for phone (outbound call with all details)');
           
           // Find record in secondary base by phone number
           const record = await secondaryAirtable.findRecordByPhone(phoneNumber);
           
           if (record) {
-            // Update the last call date AND duration
-            const updated = await secondaryAirtable.updateLastCallDateAndDuration(
+            // Update the last call date, duration, AND recording URL
+            const updated = await secondaryAirtable.updateCallDetails(
               record.id, 
               callData.dateConnected,
-              durationFormatted
+              durationFormatted,
+              callData.recordingUrl
             );
             
             if (updated) {
@@ -989,9 +1011,10 @@ async function sync() {
                 recordId: record.id,
                 dateConnected: callData.dateConnected,
                 durationFormatted,
+                hasRecording: !!callData.recordingUrl,
                 direction: 'outbound',
                 success: true
-              }, 'Updated secondary base record with outbound call and duration');
+              }, 'Updated secondary base record with all call details');
             }
           } else {
             logger.warn({
@@ -1007,7 +1030,7 @@ async function sync() {
         }
       }
       
-      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls with durations)`);
+      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls with all details)`);
     } else if (!secondaryAirtable) {
       logger.info('Secondary Airtable not configured');
     } else if (latestOutboundCalls.size === 0) {
