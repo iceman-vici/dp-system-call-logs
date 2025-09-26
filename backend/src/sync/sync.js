@@ -28,11 +28,12 @@ const config = {
     callsUnmatchedPhone: process.env.CALLS_UNMATCHED_PHONE_FIELD
   },
   sync: {
-    daysBack: parseInt(process.env.DAYS_BACK || '7'),
-    backfillGraceSeconds: parseInt(process.env.BACKFILL_GRACE_SECONDS || '3600'),
+    daysBack: parseInt(process.env.DAYS_BACK || '0'), // Default to 0 for real-time
+    backfillGraceSeconds: parseInt(process.env.BACKFILL_GRACE_SECONDS || '300'), // 5 minutes
     defaultRegion: process.env.DEFAULT_REGION || 'SG',
     pageSize: Math.min(parseInt(process.env.PAGE_SIZE || '50'), 50), // Enforce max 50
-    displayTimezone: process.env.DISPLAY_TIMEZONE || 'America/New_York'
+    displayTimezone: process.env.DISPLAY_TIMEZONE || 'America/New_York',
+    realtimeOnly: process.env.REALTIME_ONLY === 'true' // New flag for real-time only mode
   }
 };
 
@@ -62,8 +63,16 @@ function validateConfig() {
     airtableConfigured: !!config.airtable.pat,
     daysBack: config.sync.daysBack,
     pageSize: config.sync.pageSize,
-    displayTimezone: config.sync.displayTimezone
+    displayTimezone: config.sync.displayTimezone,
+    realtimeOnly: config.sync.realtimeOnly
   }, 'Config details');
+}
+
+// Get start of current day in milliseconds
+function getStartOfToday() {
+  const now = new Date();
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return startOfDay.getTime();
 }
 
 // Dialpad API client
@@ -99,7 +108,7 @@ class DialpadClient {
       // Try a simple API call to test the connection
       const response = await this.axios.get('/api/v2/call', {
         params: {
-          started_after: Date.now() - (24 * 60 * 60 * 1000), // Last 24 hours
+          started_after: Date.now() - (60 * 60 * 1000), // Last hour
           started_before: Date.now(),
           limit: 1
         }
@@ -304,23 +313,41 @@ async function sync() {
     logger.info(`Loaded ${customerPhoneMap.size} customers with phone numbers`);
 
     // Determine sync window
-    const lastSyncedMs = (await state.getLastSynced()) * 1000; // Convert to ms
     const now = Date.now();
-    const daysBackMs = config.sync.daysBack * 24 * 60 * 60 * 1000;
+    const lastSyncedMs = (await state.getLastSynced()) * 1000; // Convert to ms
     const backfillGraceMs = config.sync.backfillGraceSeconds * 1000;
     
-    // Use milliseconds for Dialpad API
-    const startedAfter = Math.max(
-      now - daysBackMs,
-      lastSyncedMs > 0 ? lastSyncedMs - backfillGraceMs : now - daysBackMs
-    );
+    let startedAfter;
+    
+    if (config.sync.realtimeOnly || config.sync.daysBack === 0) {
+      // Real-time mode: only sync from today or last sync time
+      if (lastSyncedMs > 0) {
+        // If we've synced before, start from last sync with small grace period
+        startedAfter = lastSyncedMs - backfillGraceMs;
+        logger.info('Real-time mode: Syncing from last sync time');
+      } else {
+        // First sync: start from beginning of today
+        startedAfter = getStartOfToday();
+        logger.info('Real-time mode: First sync - starting from today');
+      }
+    } else {
+      // Historical mode: sync from X days back
+      const daysBackMs = config.sync.daysBack * 24 * 60 * 60 * 1000;
+      startedAfter = Math.max(
+        now - daysBackMs,
+        lastSyncedMs > 0 ? lastSyncedMs - backfillGraceMs : now - daysBackMs
+      );
+      logger.info(`Historical mode: Syncing from ${config.sync.daysBack} days back`);
+    }
+    
     const startedBefore = now;
     
     logger.info({
+      mode: config.sync.realtimeOnly ? 'Real-time' : 'Historical',
       lastSynced: lastSyncedMs > 0 ? new Date(lastSyncedMs).toISOString() : 'Never',
       startedAfter: new Date(startedAfter).toISOString(),
       startedBefore: new Date(startedBefore).toISOString(),
-      daysBack: config.sync.daysBack
+      timeWindow: `${Math.round((startedBefore - startedAfter) / (1000 * 60))} minutes`
     }, 'Sync window determined');
 
     // Fetch and process calls with pagination
@@ -350,7 +377,11 @@ async function sync() {
       }
       
       if (!calls || calls.length === 0) {
-        logger.info('No more calls to process');
+        if (pageCount === 1) {
+          logger.info('No calls found in the specified time window');
+        } else {
+          logger.info('No more calls to process');
+        }
         break;
       }
 
@@ -455,13 +486,18 @@ async function sync() {
       
     } while (cursor);
 
-    logger.info({
-      totalCalls,
-      matchedCalls,
-      unmatchedCalls: totalCalls - matchedCalls,
-      matchRate: totalCalls > 0 ? (matchedCalls / totalCalls * 100).toFixed(2) + '%' : 'N/A',
-      pagesProcessed: pageCount
-    }, 'Sync completed successfully');
+    // Final summary
+    if (totalCalls === 0) {
+      logger.info('No new calls to sync for the specified time period');
+    } else {
+      logger.info({
+        totalCalls,
+        matchedCalls,
+        unmatchedCalls: totalCalls - matchedCalls,
+        matchRate: totalCalls > 0 ? (matchedCalls / totalCalls * 100).toFixed(2) + '%' : 'N/A',
+        pagesProcessed: pageCount
+      }, 'Sync completed successfully');
+    }
 
     return {
       success: true,
