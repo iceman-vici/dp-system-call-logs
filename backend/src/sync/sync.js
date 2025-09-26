@@ -231,6 +231,16 @@ function getStartOfToday() {
   return startOfDay.getTime();
 }
 
+// Extract recording ID from URL
+function extractRecordingId(url) {
+  if (!url) return null;
+  
+  // URL format: https://dialpad.com/blob/adminrecording/5572425564274688.mp3
+  // Or: https://dialpad.com/recording/5572425564274688
+  const match = url.match(/\/(\d+)(?:\.mp3)?(?:\?.*)?$/);
+  return match ? match[1] : null;
+}
+
 // Dialpad API client
 class DialpadClient {
   constructor() {
@@ -340,6 +350,37 @@ class DialpadClient {
         throw new Error(`Dialpad API error: ${errorMessage}`);
       }
       throw error;
+    }
+  }
+
+  async getRecordingShareLink(recordingId, recordingType = 'admincallrecording') {
+    if (!recordingId) return null;
+    
+    try {
+      logger.debug(`Getting share link for recording ${recordingId}`);
+      
+      const response = await this.axios.post('/api/v2/recordingsharelink', {
+        recording_id: recordingId,
+        recording_type: recordingType,
+        privacy: 'public'
+      }, {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      // The response should contain an access_link
+      if (response.data && response.data.access_link) {
+        logger.debug(`Got share link for recording ${recordingId}: ${response.data.access_link}`);
+        return response.data.access_link;
+      }
+      
+      logger.warn(`No access_link in response for recording ${recordingId}`);
+      return null;
+    } catch (error) {
+      logger.error(`Failed to get share link for recording ${recordingId}:`, error.message);
+      // Return null instead of throwing to continue processing other calls
+      return null;
     }
   }
 }
@@ -648,11 +689,29 @@ async function sync() {
         // Note: Call Date is a computed field in Airtable, so we don't set it
         // It will be automatically calculated from Start Time
 
-        // Add recording URL if available
+        // Handle recording URL - get shareable link
+        let recordingUrl = null;
         if (call.recording_url && call.recording_url.length > 0) {
-          callRecord['Recording URL'] = call.recording_url[0];
+          recordingUrl = call.recording_url[0];
         } else if (call.admin_recording_urls && call.admin_recording_urls.length > 0) {
-          callRecord['Recording URL'] = call.admin_recording_urls[0];
+          recordingUrl = call.admin_recording_urls[0];
+        }
+        
+        if (recordingUrl) {
+          const recordingId = extractRecordingId(recordingUrl);
+          if (recordingId) {
+            logger.debug(`Getting share link for recording ${recordingId}`);
+            const shareLink = await dialpad.getRecordingShareLink(recordingId);
+            if (shareLink) {
+              callRecord['Recording URL'] = shareLink;
+            } else {
+              // Fall back to original URL if share link fails
+              callRecord['Recording URL'] = recordingUrl;
+            }
+          } else {
+            // Use original URL if we can't extract ID
+            callRecord['Recording URL'] = recordingUrl;
+          }
         }
 
         // Match to customer
