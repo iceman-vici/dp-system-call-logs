@@ -11,8 +11,9 @@ module.exports = {
       env: {
         NODE_ENV: 'production'
       },
-      cron_restart: '0 7 * * *', // Runs daily at 7 AM local time
-      // Alternative cron patterns:
+      cron_restart: '* * * * *', // Runs every minute for testing
+      // Production cron patterns:
+      // '0 7 * * *' - Daily at 7 AM
       // '*/15 * * * *' - Every 15 minutes
       // '0 */2 * * *' - Every 2 hours
       // '0 7,15 * * *' - At 7 AM and 3 PM daily
