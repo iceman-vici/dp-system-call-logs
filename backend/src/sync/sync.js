@@ -40,12 +40,6 @@ const config = {
     start: process.env.TIME_RANGE_START, // Format: HH:MM (e.g., "16:00" for 4 PM)
     end: process.env.TIME_RANGE_END,     // Format: HH:MM (e.g., "18:00" for 6 PM)
     timezone: process.env.TIME_RANGE_TIMEZONE || 'America/New_York'
-  },
-  businessHours: {
-    enabled: process.env.BUSINESS_HOURS_ENABLED === 'true',
-    startHour: parseInt(process.env.BUSINESS_HOURS_START || '9'), // 9 AM
-    endHour: parseInt(process.env.BUSINESS_HOURS_END || '18'), // 6 PM (18:00)
-    timezone: process.env.BUSINESS_HOURS_TIMEZONE || 'America/New_York'
   }
 };
 
@@ -110,19 +104,6 @@ function validateConfig() {
     logger.info(`Time range configured: ${config.timeRange.start} - ${config.timeRange.end} ${config.timeRange.timezone}`);
   }
   
-  // Validate business hours if enabled and no time range
-  if (!hasTimeRangeConfig() && config.businessHours.enabled) {
-    if (config.businessHours.startHour < 0 || config.businessHours.startHour > 23) {
-      throw new Error('BUSINESS_HOURS_START must be between 0 and 23');
-    }
-    if (config.businessHours.endHour < 1 || config.businessHours.endHour > 24) {
-      throw new Error('BUSINESS_HOURS_END must be between 1 and 24');
-    }
-    if (config.businessHours.startHour >= config.businessHours.endHour) {
-      throw new Error('BUSINESS_HOURS_END must be after BUSINESS_HOURS_START');
-    }
-  }
-  
   logger.info('Configuration validated successfully');
   logger.debug({
     dialpadConfigured: !!config.dialpad.apiKey,
@@ -133,109 +114,8 @@ function validateConfig() {
     realtimeOnly: config.sync.realtimeOnly,
     specificDate: config.sync.specificDate,
     hasTimeRange: hasTimeRangeConfig(),
-    timeRange: config.timeRange,
-    businessHours: config.businessHours
+    timeRange: config.timeRange
   }, 'Config details');
-}
-
-// Get specific time range window for a given date in UTC milliseconds
-function getTimeRangeWindow() {
-  const start = parseTime(config.timeRange.start);
-  const end = parseTime(config.timeRange.end);
-  
-  let baseDate;
-  
-  // Determine which date to use
-  if (config.sync.specificDate) {
-    // Parse YYYY-MM-DD format
-    const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
-    baseDate = new Date(year, month - 1, day); // month is 0-indexed in JS
-    logger.info(`Using specific date: ${config.sync.specificDate}`);
-  } else {
-    // Default to today when SPECIFIC_DATE is empty/not set
-    baseDate = new Date();
-    logger.info('Using today for time range');
-  }
-  
-  // Get year, month, day for the target date in the timezone
-  const tzFormatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: config.timeRange.timezone,
-    year: 'numeric',
-    month: 'numeric',
-    day: 'numeric'
-  });
-  
-  const parts = tzFormatter.formatToParts(baseDate);
-  const year = parseInt(parts.find(p => p.type === 'year').value);
-  const month = parseInt(parts.find(p => p.type === 'month').value) - 1; // JS months are 0-indexed
-  const day = parseInt(parts.find(p => p.type === 'day').value);
-  
-  // Create date objects for start and end times in the local timezone
-  // Then we'll convert them to UTC
-  const startDateTime = new Date(
-    Date.UTC(year, month, day, start.hour, start.minute, 0, 0)
-  );
-  const endDateTime = new Date(
-    Date.UTC(year, month, day, end.hour, end.minute, 0, 0)
-  );
-  
-  // Adjust for timezone offset
-  // For EDT (UTC-4), we need to add 4 hours to the UTC time to get the local time
-  const now = new Date();
-  const tzOffset = getTimezoneOffsetHours(config.timeRange.timezone);
-  
-  const startTimestamp = startDateTime.getTime() + (tzOffset * 60 * 60 * 1000);
-  const endTimestamp = endDateTime.getTime() + (tzOffset * 60 * 60 * 1000);
-  
-  // Don't go into the future
-  const finalEnd = Math.min(endTimestamp, Date.now());
-  
-  logger.debug({
-    baseDate: baseDate.toDateString(),
-    targetDate: `${year}-${(month + 1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`,
-    timeRange: `${config.timeRange.start} - ${config.timeRange.end}`,
-    timezone: config.timeRange.timezone,
-    tzOffsetHours: tzOffset,
-    startUTC: new Date(startTimestamp).toISOString(),
-    endUTC: new Date(finalEnd).toISOString(),
-    startLocal: new Date(startTimestamp).toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
-    endLocal: new Date(finalEnd).toLocaleString('en-US', { timeZone: config.timeRange.timezone })
-  }, 'Time range calculation details');
-  
-  return {
-    start: startTimestamp,
-    end: finalEnd,
-    configured: `${config.timeRange.start} - ${config.timeRange.end} ${config.timeRange.timezone}`,
-    date: `${year}-${(month + 1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`
-  };
-}
-
-// Get timezone offset in hours (EDT = -4, EST = -5, etc.)
-function getTimezoneOffsetHours(timezone) {
-  const now = new Date();
-  
-  // Check if we're in DST
-  const month = now.getMonth() + 1;
-  let isDST = false;
-  
-  // Simple DST check for US Eastern time
-  if (timezone.includes('New_York')) {
-    // DST is roughly March-November
-    if (month >= 3 && month <= 11) {
-      if (month > 3 && month < 11) {
-        isDST = true;
-      } else if (month === 3) {
-        // DST starts second Sunday in March
-        isDST = now.getDate() >= 10;
-      } else if (month === 11) {
-        // DST ends first Sunday in November  
-        isDST = now.getDate() < 3;
-      }
-    }
-    return isDST ? -4 : -5; // EDT = UTC-4, EST = UTC-5
-  }
-  
-  return 0; // Default to no offset if not Eastern time
 }
 
 // Get start of current day in milliseconds
@@ -516,52 +396,84 @@ async function sync() {
     let startedAfter;
     let startedBefore = now;
     
-    // Use specific time range if configured
+    // If time range is configured, use it
     if (hasTimeRangeConfig()) {
-      const timeWindow = getTimeRangeWindow();
-      startedAfter = timeWindow.start;
-      startedBefore = timeWindow.end;
+      const start = parseTime(config.timeRange.start);
+      const end = parseTime(config.timeRange.end);
+      
+      // Determine the base date
+      let baseDate;
+      if (config.sync.specificDate) {
+        // Use specific date
+        const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
+        baseDate = new Date(year, month - 1, day);
+        logger.info(`Using specific date: ${config.sync.specificDate}`);
+      } else {
+        // Use today
+        baseDate = new Date();
+        logger.info('Using today for time range');
+      }
+      
+      // Create start and end dates with the specified times
+      const startDate = new Date(
+        baseDate.getFullYear(),
+        baseDate.getMonth(),
+        baseDate.getDate(),
+        start.hour,
+        start.minute,
+        0,
+        0
+      );
+      
+      const endDate = new Date(
+        baseDate.getFullYear(),
+        baseDate.getMonth(),
+        baseDate.getDate(),
+        end.hour,
+        end.minute,
+        0,
+        0
+      );
+      
+      // Convert to milliseconds
+      startedAfter = startDate.getTime();
+      startedBefore = Math.min(endDate.getTime(), now); // Don't go into future
       
       logger.info({
-        timeRange: timeWindow.configured,
-        date: timeWindow.date,
-        windowStart: new Date(timeWindow.start).toISOString(),
-        windowEnd: new Date(timeWindow.end).toISOString(),
-        note: config.sync.specificDate ? `Using specific date: ${config.sync.specificDate}` : 'Using today'
-      }, 'Time range window set');
+        date: baseDate.toDateString(),
+        timeRange: `${config.timeRange.start} - ${config.timeRange.end}`,
+        timezone: config.timeRange.timezone,
+        startLocal: startDate.toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
+        endLocal: endDate.toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
+        startUTC: new Date(startedAfter).toISOString(),
+        endUTC: new Date(startedBefore).toISOString()
+      }, 'Time range window configured');
       
     } else if (config.sync.specificDate) {
-      // Use specific date without time range - fetch whole day
+      // Specific date without time range - get whole day
       const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
-      const specificDate = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
-      const nextDay = new Date(Date.UTC(year, month - 1, day + 1, 0, 0, 0));
+      const startDate = new Date(year, month - 1, day, 0, 0, 0, 0);
+      const endDate = new Date(year, month - 1, day + 1, 0, 0, 0, 0);
       
-      // Adjust for timezone
-      const tzOffset = getTimezoneOffsetHours(config.sync.displayTimezone || 'America/New_York');
-      startedAfter = specificDate.getTime() + (tzOffset * 60 * 60 * 1000);
-      startedBefore = Math.min(nextDay.getTime() + (tzOffset * 60 * 60 * 1000), now);
+      startedAfter = startDate.getTime();
+      startedBefore = Math.min(endDate.getTime(), now);
       
       logger.info({
         specificDate: config.sync.specificDate,
         windowStart: new Date(startedAfter).toISOString(),
-        windowEnd: new Date(startedBefore).toISOString(),
-        note: 'Using specific date configuration (whole day)'
-      }, 'Date window set');
+        windowEnd: new Date(startedBefore).toISOString()
+      }, 'Using specific date (whole day)');
       
     } else if (config.sync.daysBack > 0) {
-      // Historical mode: sync from X days back
+      // Historical mode
       const daysBackMs = config.sync.daysBack * 24 * 60 * 60 * 1000;
       startedAfter = now - daysBackMs;
       startedBefore = now;
       
-      logger.info({
-        daysBack: config.sync.daysBack,
-        windowStart: new Date(startedAfter).toISOString(),
-        windowEnd: new Date(startedBefore).toISOString()
-      }, `Historical mode: Syncing from ${config.sync.daysBack} days back`);
+      logger.info(`Historical mode: Syncing from ${config.sync.daysBack} days back`);
       
     } else {
-      // Real-time mode (today)
+      // Default: real-time mode (from last sync or start of today)
       if (lastSyncedMs > 0) {
         startedAfter = lastSyncedMs - backfillGraceMs;
         logger.info('Real-time mode: Syncing from last sync time');
@@ -569,7 +481,6 @@ async function sync() {
         startedAfter = getStartOfToday();
         logger.info('Real-time mode: First sync - starting from today');
       }
-      startedBefore = now;
     }
     
     // Final validation of time window
@@ -585,18 +496,17 @@ async function sync() {
         matchedCalls: 0,
         unmatchedCalls: 0,
         pagesProcessed: 0,
-        note: 'No valid time window - check your time range configuration'
+        note: 'No valid time window'
       };
     }
     
     logger.info({
-      mode: hasTimeRangeConfig() ? 'Specific Time Range' : 
+      mode: hasTimeRangeConfig() ? 'Time Range' : 
             (config.sync.specificDate ? 'Specific Date' : 
             (config.sync.daysBack > 0 ? 'Historical' : 'Real-time')),
-      lastSynced: lastSyncedMs > 0 ? new Date(lastSyncedMs).toISOString() : 'Never',
-      startedAfter: new Date(startedAfter).toISOString(),
-      startedBefore: new Date(startedBefore).toISOString(),
-      timeWindow: `${Math.round((startedBefore - startedAfter) / (1000 * 60))} minutes`
+      windowStart: new Date(startedAfter).toISOString(),
+      windowEnd: new Date(startedBefore).toISOString(),
+      windowMinutes: Math.round((startedBefore - startedAfter) / (1000 * 60))
     }, 'Sync window determined');
 
     // Fetch and process calls with pagination
@@ -604,7 +514,7 @@ async function sync() {
     let totalCalls = 0;
     let matchedCalls = 0;
     let pageCount = 0;
-    const maxPages = 200; // Safety limit (200 pages * 50 records = 10,000 calls max)
+    const maxPages = 200; // Safety limit
 
     do {
       pageCount++;
@@ -617,12 +527,11 @@ async function sync() {
         nextCursor = result.cursor;
       } catch (error) {
         logger.error(`Failed to fetch page ${pageCount}: ${error.message}`);
-        // If we've already processed some pages, continue with what we have
         if (pageCount > 1) {
           logger.info('Continuing with already fetched data...');
           break;
         }
-        throw error; // If first page fails, throw the error
+        throw error;
       }
       
       if (!calls || calls.length === 0) {
@@ -638,18 +547,18 @@ async function sync() {
       const callsToUpsert = [];
 
       for (const call of calls) {
-        // Parse call data based on actual Dialpad API structure
+        // Parse call data
         const callId = call.id || call.call_id || `${call.date_started}_${call.external_number}`;
-        const startTime = parseInt(call.date_started); // Already in milliseconds
+        const startTime = parseInt(call.date_started);
         const endTime = call.date_ended ? parseInt(call.date_ended) : null;
-        const duration = formatDuration(call.duration); // Convert to seconds
+        const duration = formatDuration(call.duration);
         const externalNumber = call.external_number;
-        const direction = call.direction; // 'inbound' or 'outbound'
+        const direction = call.direction;
         
         // Normalize phone number
         const normalizedPhone = normalizePhone(externalNumber);
 
-        // Build call record for Airtable - only use fields that exist and are writable
+        // Build call record for Airtable
         const callRecord = {
           'Call ID': callId,
           'Direction': direction === 'inbound' ? 'Inbound' : 'Outbound',
@@ -661,11 +570,8 @@ async function sync() {
           'Was Recorded': call.was_recorded || false,
           'MOS Score': call.mos_score || null
         };
-        
-        // Note: Call Date is a computed field in Airtable, so we don't set it
-        // It will be automatically calculated from Start Time
 
-        // Add recording URL if available (direct URL without share link conversion)
+        // Add recording URL if available
         if (call.recording_url && call.recording_url.length > 0) {
           callRecord['Recording URL'] = call.recording_url[0];
         } else if (call.admin_recording_urls && call.admin_recording_urls.length > 0) {
@@ -677,14 +583,12 @@ async function sync() {
           callRecord[config.fields.callsCustomerLink] = [customerPhoneMap.get(normalizedPhone)];
           matchedCalls++;
         } else {
-          // Store unmatched phone number
           callRecord[config.fields.callsUnmatchedPhone] = externalNumber || 'Unknown';
         }
 
         callsToUpsert.push(callRecord);
         totalCalls++;
         
-        // Log the first call to debug field mapping
         if (totalCalls === 1) {
           logger.debug({ callRecord }, 'First call record to be upserted');
         }
@@ -698,19 +602,18 @@ async function sync() {
           logger.info(`Successfully upserted ${callsToUpsert.length} calls`);
         } catch (error) {
           logger.error('Failed to upsert calls to Airtable:', error.message);
-          // Continue processing even if Airtable update fails
         }
       }
 
       // Update state after each page
-      await state.setLastSynced(Math.floor(now / 1000)); // Save as seconds
+      await state.setLastSynced(Math.floor(now / 1000));
       
       // Update cursor for next iteration
       cursor = nextCursor;
       
-      // Add small delay to avoid rate limiting
+      // Add delay to avoid rate limiting
       if (cursor) {
-        await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay between pages
+        await new Promise(resolve => setTimeout(resolve, 1000));
       }
       
       // Safety check
@@ -719,30 +622,16 @@ async function sync() {
         break;
       }
       
-      // Log progress
-      logger.info({
-        progress: {
-          pagesProcessed: pageCount,
-          totalCallsProcessed: totalCalls,
-          matchedSoFar: matchedCalls,
-          hasMore: !!cursor
-        }
-      }, 'Page processing complete');
-      
     } while (cursor);
 
     // Final summary
-    if (totalCalls === 0) {
-      logger.info('No new calls to sync for the specified time period');
-    } else {
-      logger.info({
-        totalCalls,
-        matchedCalls,
-        unmatchedCalls: totalCalls - matchedCalls,
-        matchRate: totalCalls > 0 ? (matchedCalls / totalCalls * 100).toFixed(2) + '%' : 'N/A',
-        pagesProcessed: pageCount
-      }, 'Sync completed successfully');
-    }
+    logger.info({
+      totalCalls,
+      matchedCalls,
+      unmatchedCalls: totalCalls - matchedCalls,
+      matchRate: totalCalls > 0 ? `${(matchedCalls / totalCalls * 100).toFixed(2)}%` : 'N/A',
+      pagesProcessed: pageCount
+    }, 'Sync completed');
 
     return {
       success: true,
