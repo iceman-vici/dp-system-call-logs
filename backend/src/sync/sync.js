@@ -31,7 +31,8 @@ const config = {
     daysBack: parseInt(process.env.DAYS_BACK || '7'), // Reduced to 7 days
     backfillGraceSeconds: parseInt(process.env.BACKFILL_GRACE_SECONDS || '3600'), // 1 hour
     defaultRegion: process.env.DEFAULT_REGION || 'SG',
-    pageSize: parseInt(process.env.PAGE_SIZE || '50') // Reduced page size
+    pageSize: parseInt(process.env.PAGE_SIZE || '50'), // Reduced page size
+    displayTimezone: process.env.DISPLAY_TIMEZONE || 'America/New_York' // For display in Airtable
   }
 };
 
@@ -54,8 +55,48 @@ function validateConfig() {
     dialpadConfigured: !!config.dialpad.apiKey,
     airtableConfigured: !!config.airtable.pat,
     daysBack: config.sync.daysBack,
-    pageSize: config.sync.pageSize
+    pageSize: config.sync.pageSize,
+    displayTimezone: config.sync.displayTimezone
   }, 'Config details');
+}
+
+// Convert UTC timestamp to EDT/EST string for Airtable
+function formatDateForAirtable(timestamp) {
+  if (!timestamp) return null;
+  
+  const date = new Date(timestamp);
+  
+  // Option 1: Store as ISO string (Airtable will display based on field settings)
+  // return date.toISOString();
+  
+  // Option 2: Store with timezone offset information
+  // This helps Airtable understand the timezone better
+  const options = {
+    timeZone: config.sync.displayTimezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  };
+  
+  // Get the date in EDT/EST
+  const formatter = new Intl.DateTimeFormat('en-US', options);
+  const parts = formatter.formatToParts(date);
+  
+  // Reconstruct in ISO-like format that Airtable understands
+  const year = parts.find(p => p.type === 'year').value;
+  const month = parts.find(p => p.type === 'month').value;
+  const day = parts.find(p => p.type === 'day').value;
+  const hour = parts.find(p => p.type === 'hour').value;
+  const minute = parts.find(p => p.type === 'minute').value;
+  const second = parts.find(p => p.type === 'second').value;
+  
+  // Return ISO format - Airtable will interpret based on field settings
+  // If field is set to specific timezone, it will display correctly
+  return `${year}-${month}-${day}T${hour}:${minute}:${second}.000Z`;
 }
 
 // Dialpad API client - Updated to match actual API
@@ -355,8 +396,20 @@ async function sync() {
           'Call ID': callId,
           'External Number': externalNumber || '',
           'Direction': direction === 'inbound' ? 'Inbound' : 'Outbound',
+          // Use ISO format - Airtable will handle timezone display based on field settings
           'Start Time': new Date(startTime).toISOString(),
           'End Time': endTime ? new Date(endTime).toISOString() : null,
+          // Alternative: Add separate fields for EDT display
+          'Start Time (EDT)': new Date(startTime).toLocaleString('en-US', { 
+            timeZone: 'America/New_York',
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+            hour12: true
+          }),
           'Duration (s)': duration,
           'Contact Name': call.contact?.name || 'Unknown',
           'Target': call.target?.name || 'N/A',
