@@ -125,6 +125,29 @@ function getStartOfToday() {
   return startOfDay.getTime();
 }
 
+// Get current date in a specific timezone
+function getTodayInTimezone(timezone) {
+  // Get current time
+  const now = new Date();
+  
+  // Format it in the target timezone to get the actual date there
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+  
+  const formatted = formatter.format(now);
+  const [month, day, year] = formatted.split('/');
+  
+  return {
+    year: parseInt(year),
+    month: parseInt(month),
+    day: parseInt(day)
+  };
+}
+
 // Get UTC timestamp for a specific time in a timezone
 function getUTCTimestamp(year, month, day, hour, minute, timezone) {
   // Create an ISO string for the date/time
@@ -442,17 +465,11 @@ async function sync() {
         [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
         logger.info(`Using specific date: ${config.sync.specificDate}`);
       } else {
-        // Use today's date IN THE TARGET TIMEZONE
-        const nowInTimezone = new Date().toLocaleString('en-US', { 
-          timeZone: config.timeRange.timezone,
-          year: 'numeric',
-          month: 'numeric',
-          day: 'numeric'
-        });
-        const [m, d, y] = nowInTimezone.split('/');
-        year = parseInt(y);
-        month = parseInt(m);
-        day = parseInt(d);
+        // Use today's date IN THE TARGET TIMEZONE (not system timezone)
+        const todayInTimezone = getTodayInTimezone(config.timeRange.timezone);
+        year = todayInTimezone.year;
+        month = todayInTimezone.month;
+        day = todayInTimezone.day;
         logger.info(`Using today in ${config.timeRange.timezone}: ${year}-${month}-${day}`);
       }
       
