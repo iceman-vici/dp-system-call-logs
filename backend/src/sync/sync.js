@@ -125,21 +125,37 @@ function getStartOfToday() {
   return startOfDay.getTime();
 }
 
-// Create date in timezone
-function createDateInTimezone(year, month, day, hour, minute, timezone) {
-  // Create a date string in ISO format
+// Get UTC timestamp for a specific time in a timezone
+function getUTCTimestamp(year, month, day, hour, minute, timezone) {
+  // Create an ISO string for the date/time
   const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
   
-  // Parse it as a date in the specified timezone
-  const date = new Date(dateStr);
+  // Create date object (will be in system timezone)
+  const localDate = new Date(dateStr);
   
-  // For EDT (UTC-4), add 4 hours to get UTC time
-  // For EST (UTC-5), add 5 hours to get UTC time
-  const isDST = timezone.includes('New_York') && (month >= 3 && month <= 11);
-  const offsetHours = isDST ? 4 : 5;
+  // Get the timezone offset for EDT/EST
+  // EDT (summer) = UTC-4, EST (winter) = UTC-5
+  // September is EDT (Daylight Saving Time)
+  let offsetHours = 4; // EDT offset
+  if (timezone.includes('New_York')) {
+    // Check if we're in DST (roughly March-November)
+    if (month >= 11 || month <= 2) {
+      offsetHours = 5; // EST
+    } else {
+      offsetHours = 4; // EDT
+    }
+  }
   
-  // Return the timestamp adjusted for timezone
-  return date.getTime() + (offsetHours * 60 * 60 * 1000);
+  // The date we created is in system time, but we want it to represent EDT time
+  // So we need to adjust based on the system's offset vs EDT offset
+  const systemOffset = localDate.getTimezoneOffset(); // in minutes, positive for west of UTC
+  const edtOffsetMinutes = offsetHours * 60; // EDT is 240 minutes behind UTC
+  
+  // Adjust the timestamp
+  const adjustmentMinutes = systemOffset - edtOffsetMinutes;
+  const utcTimestamp = localDate.getTime() + (adjustmentMinutes * 60 * 1000);
+  
+  return utcTimestamp;
 }
 
 // Dialpad API client
@@ -427,7 +443,6 @@ async function sync() {
         logger.info(`Using specific date: ${config.sync.specificDate}`);
       } else {
         // Use today's date IN THE TARGET TIMEZONE
-        // This is crucial - we need today's date in EDT, not UTC
         const nowInTimezone = new Date().toLocaleString('en-US', { 
           timeZone: config.timeRange.timezone,
           year: 'numeric',
@@ -441,9 +456,9 @@ async function sync() {
         logger.info(`Using today in ${config.timeRange.timezone}: ${year}-${month}-${day}`);
       }
       
-      // Create timestamps for the time range
-      startedAfter = createDateInTimezone(year, month, day, start.hour, start.minute, config.timeRange.timezone);
-      startedBefore = createDateInTimezone(year, month, day, end.hour, end.minute, config.timeRange.timezone);
+      // Get UTC timestamps for the time range
+      startedAfter = getUTCTimestamp(year, month, day, start.hour, start.minute, config.timeRange.timezone);
+      startedBefore = getUTCTimestamp(year, month, day, end.hour, end.minute, config.timeRange.timezone);
       
       // Don't go into future
       startedBefore = Math.min(startedBefore, now);
@@ -454,16 +469,18 @@ async function sync() {
         timezone: config.timeRange.timezone,
         startUTC: new Date(startedAfter).toISOString(),
         endUTC: new Date(startedBefore).toISOString(),
-        startLocal: new Date(startedAfter).toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
-        endLocal: new Date(startedBefore).toLocaleString('en-US', { timeZone: config.timeRange.timezone })
+        startInTimezone: new Date(startedAfter).toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
+        endInTimezone: new Date(startedBefore).toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
+        systemTimezoneOffset: new Date().getTimezoneOffset(),
+        note: 'Times shown in target timezone'
       }, 'Time range window configured');
       
     } else if (config.sync.specificDate) {
       // Specific date without time range - get whole day
       const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
-      startedAfter = createDateInTimezone(year, month, day, 0, 0, config.timeRange.timezone);
+      startedAfter = getUTCTimestamp(year, month, day, 0, 0, config.timeRange.timezone);
       startedBefore = Math.min(
-        createDateInTimezone(year, month, day, 23, 59, config.timeRange.timezone),
+        getUTCTimestamp(year, month, day, 23, 59, config.timeRange.timezone),
         now
       );
       
