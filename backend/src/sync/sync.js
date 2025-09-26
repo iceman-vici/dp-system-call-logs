@@ -776,8 +776,8 @@ async function sync() {
     let pageCount = 0;
     const maxPages = 200; // Safety limit
 
-    // Track latest connected inbound call per phone number for secondary base updates
-    const latestInboundCalls = new Map(); // phoneNumber -> dateConnected
+    // Track latest connected OUTBOUND call per phone number for secondary base updates
+    const latestOutboundCalls = new Map(); // phoneNumber -> dateConnected
 
     do {
       pageCount++;
@@ -827,21 +827,22 @@ async function sync() {
           missedCalls++;
         }
         
-        // Track latest connected inbound call for secondary base update
-        if (direction === 'inbound' && wasConnected && externalNumber) {
+        // Track latest connected OUTBOUND call for secondary base update
+        // CHANGED: Now tracking outbound instead of inbound
+        if (direction === 'outbound' && wasConnected && externalNumber) {
           const dateConnectedISO = new Date(connectedTime).toISOString();
-          const existing = latestInboundCalls.get(externalNumber);
+          const existing = latestOutboundCalls.get(externalNumber);
           
           // Keep only the latest connected call per phone number
           if (!existing || connectedTime > new Date(existing).getTime()) {
-            latestInboundCalls.set(externalNumber, dateConnectedISO);
+            latestOutboundCalls.set(externalNumber, dateConnectedISO);
             logger.info({
               direction,
               wasConnected,
               externalNumber,
               dateConnected: dateConnectedISO,
-              action: 'Tracking for secondary base update'
-            }, 'Connected inbound call tracked');
+              action: 'Tracking for secondary base update (OUTBOUND)'
+            }, 'Connected outbound call tracked');
           }
         }
         
@@ -923,16 +924,17 @@ async function sync() {
       
     } while (cursor);
 
-    // Update secondary Airtable base with latest connected inbound calls
-    if (secondaryAirtable && latestInboundCalls.size > 0) {
+    // Update secondary Airtable base with latest connected OUTBOUND calls
+    if (secondaryAirtable && latestOutboundCalls.size > 0) {
       logger.info({
-        count: latestInboundCalls.size,
-        phoneNumbers: Array.from(latestInboundCalls.keys())
-      }, 'Updating secondary base with latest connected inbound calls');
+        count: latestOutboundCalls.size,
+        phoneNumbers: Array.from(latestOutboundCalls.keys()),
+        direction: 'OUTBOUND'
+      }, 'Updating secondary base with latest connected outbound calls');
       
-      for (const [phoneNumber, dateConnected] of latestInboundCalls) {
+      for (const [phoneNumber, dateConnected] of latestOutboundCalls) {
         try {
-          logger.info(`Processing update for phone: ${phoneNumber}`);
+          logger.info(`Processing update for phone: ${phoneNumber} (outbound call)`);
           
           // Find record in secondary base by phone number
           const record = await secondaryAirtable.findRecordByPhone(phoneNumber);
@@ -947,12 +949,14 @@ async function sync() {
                 phoneNumber,
                 recordId: record.id,
                 dateConnected,
+                direction: 'outbound',
                 success: true
-              }, 'Updated secondary base record');
+              }, 'Updated secondary base record with outbound call');
             }
           } else {
             logger.warn({
-              phoneNumber
+              phoneNumber,
+              direction: 'outbound'
             }, 'No matching record found in secondary base');
           }
         } catch (error) {
@@ -963,11 +967,11 @@ async function sync() {
         }
       }
       
-      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestInboundCalls.size} records updated`);
+      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls)`);
     } else if (!secondaryAirtable) {
       logger.info('Secondary Airtable not configured');
-    } else if (latestInboundCalls.size === 0) {
-      logger.info('No connected inbound calls to update in secondary base');
+    } else if (latestOutboundCalls.size === 0) {
+      logger.info('No connected outbound calls to update in secondary base');
     }
 
     // Final summary
