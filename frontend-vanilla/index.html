@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dialpad Call Logs System</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="stylesheet" href="css/dashboard.css">
+    <link rel="stylesheet" href="css/components.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
+</head>
+<body>
+    <!-- Sidebar Navigation -->
+    <nav class="sidebar" id="sidebar">
+        <div class="sidebar-header">
+            <h2>DP Logs</h2>
+            <button class="sidebar-toggle" id="sidebarToggle">
+                <span class="material-icons">menu</span>
+            </button>
+        </div>
+        <ul class="nav-menu">
+            <li class="nav-item active" data-page="dashboard">
+                <span class="material-icons">dashboard</span>
+                <span class="nav-text">Dashboard</span>
+            </li>
+            <li class="nav-item" data-page="calls">
+                <span class="material-icons">phone</span>
+                <span class="nav-text">Call Logs</span>
+            </li>
+            <li class="nav-item" data-page="analytics">
+                <span class="material-icons">analytics</span>
+                <span class="nav-text">Analytics</span>
+            </li>
+            <li class="nav-item" data-page="customers">
+                <span class="material-icons">people</span>
+                <span class="nav-text">Customers</span>
+            </li>
+            <li class="nav-item" data-page="sync">
+                <span class="material-icons">sync</span>
+                <span class="nav-text">Sync Status</span>
+            </li>
+            <li class="nav-item" data-page="settings">
+                <span class="material-icons">settings</span>
+                <span class="nav-text">Settings</span>
+            </li>
+        </ul>
+    </nav>
+
+    <!-- Main Content Area -->
+    <main class="main-content">
+        <!-- Top Bar -->
+        <header class="top-bar">
+            <h1 id="pageTitle">Dashboard</h1>
+            <div class="top-bar-actions">
+                <div class="sync-indicator" id="syncIndicator">
+                    <span class="material-icons">sync</span>
+                    <span class="sync-status">Idle</span>
+                </div>
+                <button class="btn-icon" id="refreshBtn">
+                    <span class="material-icons">refresh</span>
+                </button>
+            </div>
+        </header>
+
+        <!-- Page Content Container -->
+        <div class="page-content" id="pageContent">
+            <!-- Dashboard Page -->
+            <div id="dashboardPage" class="page active">
+                <div class="stats-grid">
+                    <div class="stat-card">
+                        <div class="stat-icon blue">
+                            <span class="material-icons">phone</span>
+                        </div>
+                        <div class="stat-content">
+                            <h3>Total Calls</h3>
+                            <p class="stat-value" id="totalCalls">0</p>
+                            <span class="stat-label">Last 7 days</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon purple">
+                            <span class="material-icons">schedule</span>
+                        </div>
+                        <div class="stat-content">
+                            <h3>Avg Duration</h3>
+                            <p class="stat-value" id="avgDuration">0s</p>
+                            <span class="stat-label">Per call</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon green">
+                            <span class="material-icons">people</span>
+                        </div>
+                        <div class="stat-content">
+                            <h3>Match Rate</h3>
+                            <p class="stat-value" id="matchRate">0%</p>
+                            <span class="stat-label">Customer matching</span>
+                        </div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-icon orange">
+                            <span class="material-icons">trending_up</span>
+                        </div>
+                        <div class="stat-content">
+                            <h3>Peak Hour</h3>
+                            <p class="stat-value" id="peakHour">N/A</p>
+                            <span class="stat-label" id="peakHourCalls"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="charts-grid">
+                    <div class="chart-container">
+                        <h3>Call Trends (Last 7 Days)</h3>
+                        <canvas id="trendsChart"></canvas>
+                    </div>
+                    <div class="chart-container">
+                        <h3>Call Direction</h3>
+                        <canvas id="directionChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Call Logs Page -->
+            <div id="callsPage" class="page">
+                <div class="page-header">
+                    <div class="filters-bar">
+                        <input type="text" id="searchInput" placeholder="Search phone numbers..." class="form-input">
+                        <select id="directionFilter" class="form-select">
+                            <option value="">All Directions</option>
+                            <option value="Inbound">Inbound</option>
+                            <option value="Outbound">Outbound</option>
+                        </select>
+                        <select id="matchedFilter" class="form-select">
+                            <option value="">All Status</option>
+                            <option value="true">Matched</option>
+                            <option value="false">Unmatched</option>
+                        </select>
+                        <button class="btn btn-secondary" id="clearFilters">Clear Filters</button>
+                        <button class="btn btn-primary" id="exportBtn">
+                            <span class="material-icons">download</span>
+                            Export CSV
+                        </button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table class="data-table" id="callsTable">
+                        <thead>
+                            <tr>
+                                <th>Call ID</th>
+                                <th>Direction</th>
+                                <th>From</th>
+                                <th>To</th>
+                                <th>Start Time</th>
+                                <th>Duration</th>
+                                <th>Customer</th>
+                            </tr>
+                        </thead>
+                        <tbody id="callsTableBody">
+                            <!-- Populated by JavaScript -->
+                        </tbody>
+                    </table>
+                    <div class="pagination" id="callsPagination"></div>
+                </div>
+            </div>
+
+            <!-- Analytics Page -->
+            <div id="analyticsPage" class="page">
+                <div class="page-header">
+                    <select id="periodSelect" class="form-select">
+                        <option value="24h">Last 24 Hours</option>
+                        <option value="7d" selected>Last 7 Days</option>
+                        <option value="30d">Last 30 Days</option>
+                        <option value="90d">Last 90 Days</option>
+                    </select>
+                </div>
+                <div class="analytics-grid">
+                    <div class="chart-container full-width">
+                        <h3>Call Volume Trends</h3>
+                        <canvas id="volumeChart"></canvas>
+                    </div>
+                    <div class="chart-container">
+                        <h3>Hourly Distribution</h3>
+                        <canvas id="hourlyChart"></canvas>
+                    </div>
+                    <div class="chart-container">
+                        <h3>Customer Matching</h3>
+                        <canvas id="matchingChart"></canvas>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Customers Page -->
+            <div id="customersPage" class="page">
+                <div class="page-header">
+                    <div class="filters-bar">
+                        <input type="text" id="customerSearch" placeholder="Search customers..." class="form-input">
+                        <button class="btn btn-primary" id="syncCustomersBtn">
+                            <span class="material-icons">sync</span>
+                            Sync from Airtable
+                        </button>
+                    </div>
+                </div>
+                <div class="table-container">
+                    <table class="data-table" id="customersTable">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Phone</th>
+                                <th>Email</th>
+                                <th>Company</th>
+                                <th>Status</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="customersTableBody">
+                            <!-- Populated by JavaScript -->
+                        </tbody>
+                    </table>
+                    <div class="pagination" id="customersPagination"></div>
+                </div>
+            </div>
+
+            <!-- Sync Status Page -->
+            <div id="syncPage" class="page">
+                <div class="sync-status-card">
+                    <h3>Current Sync Status</h3>
+                    <div class="sync-status-content">
+                        <div class="status-indicator" id="syncStatusIndicator">
+                            <span class="status-dot idle"></span>
+                            <span class="status-text">Idle</span>
+                        </div>
+                        <div class="sync-info" id="syncInfo">
+                            <!-- Populated by JavaScript -->
+                        </div>
+                        <div class="sync-actions">
+                            <button class="btn btn-primary" id="triggerSyncBtn">
+                                <span class="material-icons">play_arrow</span>
+                                Trigger Sync
+                            </button>
+                            <button class="btn btn-danger" id="resetStateBtn">
+                                <span class="material-icons">restart_alt</span>
+                                Reset State
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="sync-history-card">
+                    <h3>Sync History</h3>
+                    <div class="history-list" id="syncHistoryList">
+                        <!-- Populated by JavaScript -->
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings Page -->
+            <div id="settingsPage" class="page">
+                <div class="settings-grid">
+                    <div class="settings-card">
+                        <h3>Dialpad Configuration</h3>
+                        <div class="config-status" id="dialpadStatus">
+                            <span class="status-badge not-configured">Not Configured</span>
+                        </div>
+                        <button class="btn btn-secondary" id="testDialpadBtn">Test Connection</button>
+                        <div class="test-result" id="dialpadTestResult"></div>
+                    </div>
+                    <div class="settings-card">
+                        <h3>Airtable Configuration</h3>
+                        <div class="config-status" id="airtableStatus">
+                            <span class="status-badge not-configured">Not Configured</span>
+                        </div>
+                        <button class="btn btn-secondary" id="testAirtableBtn">Test Connection</button>
+                        <div class="test-result" id="airtableTestResult"></div>
+                    </div>
+                </div>
+                <div class="settings-card full-width">
+                    <h3>Sync Configuration</h3>
+                    <div class="config-info" id="syncConfigInfo">
+                        <!-- Populated by JavaScript -->
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="spinner"></div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toastContainer"></div>
+
+    <!-- Modal Dialog -->
+    <div class="modal" id="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="modalTitle">Modal Title</h3>
+                <button class="modal-close" id="modalClose">&times;</button>
+            </div>
+            <div class="modal-body" id="modalBody">
+                <!-- Dynamic content -->
+            </div>
+            <div class="modal-footer" id="modalFooter">
+                <button class="btn btn-secondary" id="modalCancel">Cancel</button>
+                <button class="btn btn-primary" id="modalConfirm">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="js/config.js"></script>
+    <script src="js/api.js"></script>
+    <script src="js/utils.js"></script>
+    <script src="js/components.js"></script>
+    <script src="js/pages/dashboard.js"></script>
+    <script src="js/pages/calls.js"></script>
+    <script src="js/pages/analytics.js"></script>
+    <script src="js/pages/customers.js"></script>
+    <script src="js/pages/sync.js"></script>
+    <script src="js/pages/settings.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
