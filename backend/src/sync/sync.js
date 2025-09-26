@@ -28,7 +28,8 @@ const config = {
     baseId: process.env.SECONDARY_AIRTABLE_BASE_ID,
     table: process.env.SECONDARY_AIRTABLE_TABLE,
     phoneField: process.env.SECONDARY_PHONE_FIELD || 'Phone Format',
-    lastCallField: process.env.SECONDARY_LAST_CALL_FIELD || 'Dialpad Last Connected Call Date'
+    lastCallField: process.env.SECONDARY_LAST_CALL_FIELD || 'Dialpad Last Connected Call Date',
+    durationField: process.env.SECONDARY_DURATION_FIELD || 'Dialpad Call Length'
   },
   fields: {
     customerPhone: process.env.CUSTOMER_PHONE_FIELD || 'Phone',
@@ -123,6 +124,7 @@ function validateConfig() {
       table: config.secondaryAirtable.table,
       phoneField: config.secondaryAirtable.phoneField,
       lastCallField: config.secondaryAirtable.lastCallField,
+      durationField: config.secondaryAirtable.durationField,
       usingSharedPAT: config.secondaryAirtable.pat === config.airtable.pat
     }, 'Secondary Airtable config');
   }
@@ -541,13 +543,17 @@ class SecondaryAirtableClient {
     }
   }
 
-  async updateLastCallDate(recordId, dateConnected) {
+  async updateLastCallDateAndDuration(recordId, dateConnected, durationFormatted) {
     try {
       logger.info({
         recordId,
         dateConnected,
-        field: config.secondaryAirtable.lastCallField
-      }, 'Updating last call date in secondary base');
+        durationFormatted,
+        fields: {
+          lastCallField: config.secondaryAirtable.lastCallField,
+          durationField: config.secondaryAirtable.durationField
+        }
+      }, 'Updating last call date and duration in secondary base');
       
       await this.axios.patch(
         `/${encodeURIComponent(config.secondaryAirtable.table)}`,
@@ -555,7 +561,8 @@ class SecondaryAirtableClient {
           records: [{
             id: recordId,
             fields: {
-              [config.secondaryAirtable.lastCallField]: dateConnected
+              [config.secondaryAirtable.lastCallField]: dateConnected,
+              [config.secondaryAirtable.durationField]: durationFormatted
             }
           }]
         }
@@ -563,8 +570,9 @@ class SecondaryAirtableClient {
       
       logger.info({
         recordId,
-        dateConnected
-      }, 'Successfully updated last call date');
+        dateConnected,
+        durationFormatted
+      }, 'Successfully updated last call date and duration');
       
       return true;
     } catch (error) {
@@ -572,7 +580,7 @@ class SecondaryAirtableClient {
         recordId,
         error: error.message,
         errorData: error.response?.data
-      }, 'Failed to update last call date in secondary base');
+      }, 'Failed to update last call date and duration in secondary base');
       return false;
     }
   }
@@ -593,6 +601,20 @@ function normalizePhone(number, defaultRegion = config.sync.defaultRegion) {
 // Format duration from milliseconds to seconds
 function formatDuration(ms) {
   return Math.floor((ms || 0) / 1000);
+}
+
+// Format duration in seconds to MM:SS format
+function formatDurationToMMSS(seconds) {
+  if (!seconds || seconds === 0) return "00:00";
+  
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  
+  // Pad with zeros to ensure two digits
+  const formattedMinutes = String(minutes).padStart(2, '0');
+  const formattedSeconds = String(remainingSeconds).padStart(2, '0');
+  
+  return `${formattedMinutes}:${formattedSeconds}`;
 }
 
 // Main sync function
@@ -777,7 +799,8 @@ async function sync() {
     const maxPages = 200; // Safety limit
 
     // Track latest connected OUTBOUND call per phone number for secondary base updates
-    const latestOutboundCalls = new Map(); // phoneNumber -> dateConnected
+    // Now also storing duration
+    const latestOutboundCalls = new Map(); // phoneNumber -> {dateConnected, duration}
 
     do {
       pageCount++;
@@ -828,21 +851,26 @@ async function sync() {
         }
         
         // Track latest connected OUTBOUND call for secondary base update
-        // CHANGED: Now tracking outbound instead of inbound
+        // Now also tracking duration
         if (direction === 'outbound' && wasConnected && externalNumber) {
           const dateConnectedISO = new Date(connectedTime).toISOString();
           const existing = latestOutboundCalls.get(externalNumber);
           
           // Keep only the latest connected call per phone number
-          if (!existing || connectedTime > new Date(existing).getTime()) {
-            latestOutboundCalls.set(externalNumber, dateConnectedISO);
+          if (!existing || connectedTime > new Date(existing.dateConnected).getTime()) {
+            latestOutboundCalls.set(externalNumber, {
+              dateConnected: dateConnectedISO,
+              duration: duration // Duration in seconds
+            });
             logger.info({
               direction,
               wasConnected,
               externalNumber,
               dateConnected: dateConnectedISO,
+              duration: duration,
+              durationFormatted: formatDurationToMMSS(duration),
               action: 'Tracking for secondary base update (OUTBOUND)'
-            }, 'Connected outbound call tracked');
+            }, 'Connected outbound call tracked with duration');
           }
         }
         
@@ -924,34 +952,46 @@ async function sync() {
       
     } while (cursor);
 
-    // Update secondary Airtable base with latest connected OUTBOUND calls
+    // Update secondary Airtable base with latest connected OUTBOUND calls and durations
     if (secondaryAirtable && latestOutboundCalls.size > 0) {
       logger.info({
         count: latestOutboundCalls.size,
         phoneNumbers: Array.from(latestOutboundCalls.keys()),
         direction: 'OUTBOUND'
-      }, 'Updating secondary base with latest connected outbound calls');
+      }, 'Updating secondary base with latest connected outbound calls and durations');
       
-      for (const [phoneNumber, dateConnected] of latestOutboundCalls) {
+      for (const [phoneNumber, callData] of latestOutboundCalls) {
         try {
-          logger.info(`Processing update for phone: ${phoneNumber} (outbound call)`);
+          const durationFormatted = formatDurationToMMSS(callData.duration);
+          
+          logger.info({
+            phoneNumber,
+            dateConnected: callData.dateConnected,
+            duration: callData.duration,
+            durationFormatted
+          }, 'Processing update for phone (outbound call with duration)');
           
           // Find record in secondary base by phone number
           const record = await secondaryAirtable.findRecordByPhone(phoneNumber);
           
           if (record) {
-            // Update the last call date
-            const updated = await secondaryAirtable.updateLastCallDate(record.id, dateConnected);
+            // Update the last call date AND duration
+            const updated = await secondaryAirtable.updateLastCallDateAndDuration(
+              record.id, 
+              callData.dateConnected,
+              durationFormatted
+            );
             
             if (updated) {
               secondaryUpdates++;
               logger.info({
                 phoneNumber,
                 recordId: record.id,
-                dateConnected,
+                dateConnected: callData.dateConnected,
+                durationFormatted,
                 direction: 'outbound',
                 success: true
-              }, 'Updated secondary base record with outbound call');
+              }, 'Updated secondary base record with outbound call and duration');
             }
           } else {
             logger.warn({
@@ -967,7 +1007,7 @@ async function sync() {
         }
       }
       
-      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls)`);
+      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls with durations)`);
     } else if (!secondaryAirtable) {
       logger.info('Secondary Airtable not configured');
     } else if (latestOutboundCalls.size === 0) {
