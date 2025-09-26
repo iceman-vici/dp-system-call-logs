@@ -399,6 +399,15 @@ function formatDuration(ms) {
   return Math.floor((ms || 0) / 1000);
 }
 
+// Calculate ring time (time from start to when it was answered)
+function calculateRingTime(dateStarted, dateConnected) {
+  if (!dateStarted || !dateConnected) return null;
+  const startMs = parseInt(dateStarted);
+  const connectedMs = parseInt(dateConnected);
+  const ringTimeSeconds = (connectedMs - startMs) / 1000;
+  return Math.floor(ringTimeSeconds);
+}
+
 // Main sync function
 async function sync() {
   logger.info('Starting sync...');
@@ -568,6 +577,8 @@ async function sync() {
     let cursor = null;
     let totalCalls = 0;
     let matchedCalls = 0;
+    let connectedCalls = 0;
+    let missedCalls = 0;
     let pageCount = 0;
     const maxPages = 200; // Safety limit
 
@@ -603,12 +614,25 @@ async function sync() {
 
       for (const call of calls) {
         // Parse call data
-        const callId = call.id || call.call_id || `${call.date_started}_${call.external_number}`;
+        const callId = call.call_id || call.id || `${call.date_started}_${call.external_number}`;
         const startTime = parseInt(call.date_started);
+        const connectedTime = call.date_connected ? parseInt(call.date_connected) : null;
+        const rangTime = call.date_rang ? parseInt(call.date_rang) : null;
         const endTime = call.date_ended ? parseInt(call.date_ended) : null;
         const duration = formatDuration(call.duration);
+        const totalDuration = formatDuration(call.total_duration);
         const externalNumber = call.external_number;
+        const internalNumber = call.internal_number;
         const direction = call.direction;
+        const wasConnected = !!connectedTime; // True if call was answered
+        const ringTime = calculateRingTime(call.date_started, call.date_connected);
+        
+        // Count connected vs missed calls
+        if (wasConnected) {
+          connectedCalls++;
+        } else {
+          missedCalls++;
+        }
         
         // Normalize phone number
         const normalizedPhone = normalizePhone(externalNumber);
@@ -618,10 +642,18 @@ async function sync() {
           'Call ID': callId,
           'Direction': direction === 'inbound' ? 'Inbound' : 'Outbound',
           'Start Time': new Date(startTime).toISOString(),
+          'Date Connected': connectedTime ? new Date(connectedTime).toISOString() : null, // NEW FIELD
+          'Date Rang': rangTime ? new Date(rangTime).toISOString() : null, // NEW FIELD
           'End Time': endTime ? new Date(endTime).toISOString() : null,
-          'Duration (s)': duration,
+          'Duration (s)': duration, // Talk time in seconds
+          'Total Duration (s)': totalDuration, // Total call duration including ring time
+          'Ring Time (s)': ringTime, // Time to answer in seconds
+          'Was Connected': wasConnected, // NEW FIELD - checkbox/boolean
+          'Call Status': wasConnected ? 'Connected' : 'Missed', // NEW FIELD
           'Contact Name': call.contact?.name || 'Unknown',
           'Target': call.target?.name || 'N/A',
+          'Internal Number': internalNumber,
+          'External Number': externalNumber,
           'Was Recorded': call.was_recorded || false,
           'MOS Score': call.mos_score || null
         };
@@ -645,7 +677,16 @@ async function sync() {
         totalCalls++;
         
         if (totalCalls === 1) {
-          logger.debug({ callRecord }, 'First call record to be upserted');
+          logger.debug({ 
+            callRecord,
+            originalData: {
+              date_started: call.date_started,
+              date_connected: call.date_connected,
+              date_rang: call.date_rang,
+              date_ended: call.date_ended,
+              wasConnected: wasConnected
+            }
+          }, 'First call record to be upserted');
         }
       }
 
@@ -682,15 +723,20 @@ async function sync() {
     // Final summary
     logger.info({
       totalCalls,
+      connectedCalls,
+      missedCalls,
       matchedCalls,
       unmatchedCalls: totalCalls - matchedCalls,
       matchRate: totalCalls > 0 ? `${(matchedCalls / totalCalls * 100).toFixed(2)}%` : 'N/A',
+      connectionRate: totalCalls > 0 ? `${(connectedCalls / totalCalls * 100).toFixed(2)}%` : 'N/A',
       pagesProcessed: pageCount
     }, 'Sync completed');
 
     return {
       success: true,
       totalCalls,
+      connectedCalls,
+      missedCalls,
       matchedCalls,
       unmatchedCalls: totalCalls - matchedCalls,
       pagesProcessed: pageCount
