@@ -34,7 +34,7 @@ const config = {
     pageSize: Math.min(parseInt(process.env.PAGE_SIZE || '50'), 50), // Enforce max 50
     displayTimezone: process.env.DISPLAY_TIMEZONE || 'America/New_York',
     realtimeOnly: process.env.REALTIME_ONLY === 'true', // New flag for real-time only mode
-    specificDate: process.env.SPECIFIC_DATE // Format: YYYY-MM-DD
+    specificDate: process.env.SPECIFIC_DATE && process.env.SPECIFIC_DATE.trim() ? process.env.SPECIFIC_DATE.trim() : null // Format: YYYY-MM-DD
   },
   timeRange: {
     start: process.env.TIME_RANGE_START, // Format: HH:MM (e.g., "16:00" for 4 PM)
@@ -153,6 +153,7 @@ function getTimeRangeWindow(targetDate = null) {
     const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
     baseDate = new Date(year, month - 1, day); // month is 0-indexed in JS
   } else {
+    // Default to today when SPECIFIC_DATE is empty/not set
     baseDate = new Date();
   }
   
@@ -187,7 +188,10 @@ function getTimeRangeWindow(targetDate = null) {
   // Don't go into the future
   const finalEnd = Math.min(endTimestamp, Date.now());
   
+  const dateUsed = config.sync.specificDate || 'today';
+  
   logger.debug({
+    dateUsed,
     baseDate: baseDate.toISOString(),
     localStart: startDateStr,
     localEnd: endDateStr,
@@ -512,7 +516,7 @@ async function sync() {
         date: timeWindow.date,
         windowStart: new Date(timeWindow.start).toISOString(),
         windowEnd: new Date(timeWindow.end).toISOString(),
-        note: 'Using specific time range configuration'
+        note: config.sync.specificDate ? `Using specific date: ${config.sync.specificDate}` : 'Using today'
       }, 'Time range window set');
       
     } else if (config.sync.specificDate) {
