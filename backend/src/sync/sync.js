@@ -139,65 +139,63 @@ function validateConfig() {
 }
 
 // Get specific time range window for a given date in UTC milliseconds
-function getTimeRangeWindow(targetDate = null) {
+function getTimeRangeWindow() {
   const start = parseTime(config.timeRange.start);
   const end = parseTime(config.timeRange.end);
   
   let baseDate;
   
-  // Use specific date if provided, otherwise use today
-  if (targetDate) {
-    baseDate = targetDate;
-  } else if (config.sync.specificDate) {
+  // Determine which date to use
+  if (config.sync.specificDate) {
     // Parse YYYY-MM-DD format
     const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
     baseDate = new Date(year, month - 1, day); // month is 0-indexed in JS
+    logger.info(`Using specific date: ${config.sync.specificDate}`);
   } else {
     // Default to today when SPECIFIC_DATE is empty/not set
     baseDate = new Date();
+    logger.info('Using today for time range');
   }
   
-  // Get the date in the target timezone
-  const formatter = new Intl.DateTimeFormat('en-US', {
+  // Get year, month, day for the target date in the timezone
+  const tzFormatter = new Intl.DateTimeFormat('en-US', {
     timeZone: config.timeRange.timezone,
     year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
+    month: 'numeric',
+    day: 'numeric'
   });
   
-  const dateParts = formatter.format(baseDate);
-  const [month, day, year] = dateParts.split('/');
+  const parts = tzFormatter.formatToParts(baseDate);
+  const year = parseInt(parts.find(p => p.type === 'year').value);
+  const month = parseInt(parts.find(p => p.type === 'month').value) - 1; // JS months are 0-indexed
+  const day = parseInt(parts.find(p => p.type === 'day').value);
   
-  // Create date strings for start and end times
-  const startDateStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${start.hour.toString().padStart(2, '0')}:${start.minute.toString().padStart(2, '0')}:00`;
-  const endDateStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${end.hour.toString().padStart(2, '0')}:${end.minute.toString().padStart(2, '0')}:00`;
+  // Create date objects for start and end times in the local timezone
+  // Then we'll convert them to UTC
+  const startDateTime = new Date(
+    Date.UTC(year, month, day, start.hour, start.minute, 0, 0)
+  );
+  const endDateTime = new Date(
+    Date.UTC(year, month, day, end.hour, end.minute, 0, 0)
+  );
   
-  // Parse these as local times in the specified timezone
-  // We need to create dates that when converted to UTC give us the right times
-  const tzOffset = getTzOffsetMinutes(baseDate, config.timeRange.timezone);
+  // Adjust for timezone offset
+  // For EDT (UTC-4), we need to add 4 hours to the UTC time to get the local time
+  const now = new Date();
+  const tzOffset = getTimezoneOffsetHours(config.timeRange.timezone);
   
-  // Create dates in local time
-  const startLocal = new Date(startDateStr);
-  const endLocal = new Date(endDateStr);
-  
-  // Adjust for timezone offset to get UTC
-  // If timezone is EDT (UTC-4), we need to subtract the negative offset (add 4 hours)
-  const startTimestamp = startLocal.getTime() - (tzOffset * 60 * 1000);
-  const endTimestamp = endLocal.getTime() - (tzOffset * 60 * 1000);
+  const startTimestamp = startDateTime.getTime() + (tzOffset * 60 * 60 * 1000);
+  const endTimestamp = endDateTime.getTime() + (tzOffset * 60 * 60 * 1000);
   
   // Don't go into the future
   const finalEnd = Math.min(endTimestamp, Date.now());
   
-  const dateUsed = config.sync.specificDate || 'today';
-  
   logger.debug({
-    dateUsed,
-    baseDate: baseDate.toISOString(),
-    localStart: startDateStr,
-    localEnd: endDateStr,
-    tzOffsetMinutes: tzOffset,
-    startTimestamp,
-    endTimestamp,
+    baseDate: baseDate.toDateString(),
+    targetDate: `${year}-${(month + 1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`,
+    timeRange: `${config.timeRange.start} - ${config.timeRange.end}`,
+    timezone: config.timeRange.timezone,
+    tzOffsetHours: tzOffset,
     startUTC: new Date(startTimestamp).toISOString(),
     endUTC: new Date(finalEnd).toISOString(),
     startLocal: new Date(startTimestamp).toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
@@ -208,23 +206,36 @@ function getTimeRangeWindow(targetDate = null) {
     start: startTimestamp,
     end: finalEnd,
     configured: `${config.timeRange.start} - ${config.timeRange.end} ${config.timeRange.timezone}`,
-    date: baseDate.toLocaleDateString('en-US')
+    date: `${year}-${(month + 1).toString().padStart(2, '0')}-${day.toString().padStart(2, '0')}`
   };
 }
 
-// Get timezone offset in minutes (positive for west of UTC, negative for east)
-function getTzOffsetMinutes(date, timezone) {
-  // Create two dates: one in UTC and one in the target timezone
-  const utcDate = new Date(date.toLocaleString('en-US', { timeZone: 'UTC' }));
-  const tzDate = new Date(date.toLocaleString('en-US', { timeZone: timezone }));
+// Get timezone offset in hours (EDT = -4, EST = -5, etc.)
+function getTimezoneOffsetHours(timezone) {
+  const now = new Date();
   
-  // Calculate difference in minutes
-  // If timezone is behind UTC (like EDT/EST), this will be positive
-  // If timezone is ahead of UTC (like Asia), this will be negative
-  const offsetMs = utcDate - tzDate;
-  const offsetMinutes = Math.round(offsetMs / 60000);
+  // Check if we're in DST
+  const month = now.getMonth() + 1;
+  let isDST = false;
   
-  return offsetMinutes;
+  // Simple DST check for US Eastern time
+  if (timezone.includes('New_York')) {
+    // DST is roughly March-November
+    if (month >= 3 && month <= 11) {
+      if (month > 3 && month < 11) {
+        isDST = true;
+      } else if (month === 3) {
+        // DST starts second Sunday in March
+        isDST = now.getDate() >= 10;
+      } else if (month === 11) {
+        // DST ends first Sunday in November  
+        isDST = now.getDate() < 3;
+      }
+    }
+    return isDST ? -4 : -5; // EDT = UTC-4, EST = UTC-5
+  }
+  
+  return 0; // Default to no offset if not Eastern time
 }
 
 // Get start of current day in milliseconds
@@ -522,20 +533,19 @@ async function sync() {
     } else if (config.sync.specificDate) {
       // Use specific date without time range - fetch whole day
       const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
-      const specificDate = new Date(year, month - 1, day);
-      const nextDay = new Date(year, month - 1, day + 1);
+      const specificDate = new Date(Date.UTC(year, month - 1, day, 0, 0, 0));
+      const nextDay = new Date(Date.UTC(year, month - 1, day + 1, 0, 0, 0));
       
-      // Get timezone offset for the dates
-      const tzOffset = getTzOffsetMinutes(specificDate, config.sync.displayTimezone || 'America/New_York');
-      
-      startedAfter = specificDate.getTime() - (tzOffset * 60 * 1000);
-      startedBefore = Math.min(nextDay.getTime() - (tzOffset * 60 * 1000), now);
+      // Adjust for timezone
+      const tzOffset = getTimezoneOffsetHours(config.sync.displayTimezone || 'America/New_York');
+      startedAfter = specificDate.getTime() + (tzOffset * 60 * 60 * 1000);
+      startedBefore = Math.min(nextDay.getTime() + (tzOffset * 60 * 60 * 1000), now);
       
       logger.info({
         specificDate: config.sync.specificDate,
         windowStart: new Date(startedAfter).toISOString(),
         windowEnd: new Date(startedBefore).toISOString(),
-        note: 'Using specific date configuration'
+        note: 'Using specific date configuration (whole day)'
       }, 'Date window set');
       
     } else if (config.sync.daysBack > 0) {
@@ -550,8 +560,8 @@ async function sync() {
         windowEnd: new Date(startedBefore).toISOString()
       }, `Historical mode: Syncing from ${config.sync.daysBack} days back`);
       
-    } else if (config.sync.realtimeOnly || config.sync.daysBack === 0) {
-      // Real-time mode
+    } else {
+      // Real-time mode (today)
       if (lastSyncedMs > 0) {
         startedAfter = lastSyncedMs - backfillGraceMs;
         logger.info('Real-time mode: Syncing from last sync time');
@@ -559,6 +569,7 @@ async function sync() {
         startedAfter = getStartOfToday();
         logger.info('Real-time mode: First sync - starting from today');
       }
+      startedBefore = now;
     }
     
     // Final validation of time window
