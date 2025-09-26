@@ -1,48 +1,44 @@
 module.exports = {
   apps: [
     {
-      name: 'dialpad-sync-cron',
-      script: './src/sync/sync.js',
-      cwd: '/var/www/dp-system-call-logs/backend', // UPDATE THIS PATH
+      name: 'dialpad-sync',
+      script: './src/server.js',
+      cwd: '/home/ubuntu/dp-system-call-logs/backend',
       instances: 1,
-      autorestart: false,
+      exec_mode: 'fork',
+      autorestart: true,
       watch: false,
       max_memory_restart: '500M',
       env: {
-        NODE_ENV: 'production'
+        NODE_ENV: 'production',
+        PORT: 3001
       },
-      cron_restart: '* 8-18 * * *', // Runs every minute for testing
-      // Production cron patterns:
-      // '0 7 * * *' - Daily at 7 AM
-      // '*/15 * * * *' - Every 15 minutes
-      // '0 */2 * * *' - Every 2 hours
-      // '0 7,15 * * *' - At 7 AM and 3 PM daily
-      // '0 7 * * 1-5' - At 7 AM Monday-Friday
-      time: true, // Enables time-based logs
       error_file: './logs/pm2-error.log',
       out_file: './logs/pm2-out.log',
       log_file: './logs/pm2-combined.log',
+      time: true,
       merge_logs: true,
       log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
     },
     {
-      name: 'dialpad-sync-manual',
-      script: './src/sync/sync.js',
-      cwd: '/path/to/your/dp-system-call-logs/backend', // UPDATE THIS PATH
+      name: 'dialpad-cron',
+      script: './src/cron.js',
+      cwd: '/home/ubuntu/dp-system-call-logs/backend',
       instances: 1,
-      autorestart: false,
+      exec_mode: 'fork',
+      autorestart: true,
       watch: false,
-      max_memory_restart: '500M',
+      max_memory_restart: '300M',
       env: {
         NODE_ENV: 'production'
       },
-      // No cron for manual runs
+      error_file: './logs/cron-error.log',
+      out_file: './logs/cron-out.log',
+      log_file: './logs/cron-combined.log',
       time: true,
-      error_file: './logs/pm2-manual-error.log',
-      out_file: './logs/pm2-manual-out.log',
-      log_file: './logs/pm2-manual-combined.log',
       merge_logs: true,
-      log_date_format: 'YYYY-MM-DD HH:mm:ss Z'
+      log_date_format: 'YYYY-MM-DD HH:mm:ss Z',
+      cron_restart: '0 */5 * * *' // Restart every 5 hours to prevent memory leaks
     }
   ]
 };
