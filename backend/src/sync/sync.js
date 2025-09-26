@@ -35,6 +35,11 @@ const config = {
     displayTimezone: process.env.DISPLAY_TIMEZONE || 'America/New_York',
     realtimeOnly: process.env.REALTIME_ONLY === 'true' // New flag for real-time only mode
   },
+  timeRange: {
+    start: process.env.TIME_RANGE_START, // Format: HH:MM (e.g., "16:00" for 4 PM)
+    end: process.env.TIME_RANGE_END,     // Format: HH:MM (e.g., "18:00" for 6 PM)
+    timezone: process.env.TIME_RANGE_TIMEZONE || 'America/New_York'
+  },
   businessHours: {
     enabled: process.env.BUSINESS_HOURS_ENABLED === 'true',
     startHour: parseInt(process.env.BUSINESS_HOURS_START || '9'), // 9 AM
@@ -42,6 +47,18 @@ const config = {
     timezone: process.env.BUSINESS_HOURS_TIMEZONE || 'America/New_York'
   }
 };
+
+// Check if time range is configured
+function hasTimeRangeConfig() {
+  return config.timeRange.start && config.timeRange.end;
+}
+
+// Parse time string (HH:MM) to hour and minute
+function parseTime(timeStr) {
+  if (!timeStr) return null;
+  const [hour, minute] = timeStr.split(':').map(n => parseInt(n));
+  return { hour, minute };
+}
 
 // Validate configuration
 function validateConfig() {
@@ -63,8 +80,28 @@ function validateConfig() {
     config.sync.pageSize = 50;
   }
   
-  // Validate business hours
-  if (config.businessHours.enabled) {
+  // Validate time range if configured
+  if (hasTimeRangeConfig()) {
+    const start = parseTime(config.timeRange.start);
+    const end = parseTime(config.timeRange.end);
+    
+    if (!start || !end) {
+      throw new Error('TIME_RANGE_START and TIME_RANGE_END must be in HH:MM format');
+    }
+    
+    if (start.hour < 0 || start.hour > 23 || end.hour < 0 || end.hour > 23) {
+      throw new Error('Time range hours must be between 0 and 23');
+    }
+    
+    if (start.minute < 0 || start.minute > 59 || end.minute < 0 || end.minute > 59) {
+      throw new Error('Time range minutes must be between 0 and 59');
+    }
+    
+    logger.info(`Time range configured: ${config.timeRange.start} - ${config.timeRange.end} ${config.timeRange.timezone}`);
+  }
+  
+  // Validate business hours if enabled and no time range
+  if (!hasTimeRangeConfig() && config.businessHours.enabled) {
     if (config.businessHours.startHour < 0 || config.businessHours.startHour > 23) {
       throw new Error('BUSINESS_HOURS_START must be between 0 and 23');
     }
@@ -84,8 +121,68 @@ function validateConfig() {
     pageSize: config.sync.pageSize,
     displayTimezone: config.sync.displayTimezone,
     realtimeOnly: config.sync.realtimeOnly,
+    hasTimeRange: hasTimeRangeConfig(),
+    timeRange: config.timeRange,
     businessHours: config.businessHours
   }, 'Config details');
+}
+
+// Get specific time range window for today in UTC milliseconds
+function getTimeRangeWindow() {
+  const start = parseTime(config.timeRange.start);
+  const end = parseTime(config.timeRange.end);
+  
+  const now = new Date();
+  
+  // Get today's date in the specified timezone
+  const tzString = now.toLocaleDateString('en-US', { 
+    timeZone: config.timeRange.timezone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+  
+  const [month, day, year] = tzString.split('/');
+  
+  // Create start and end times for today in the timezone
+  const startTimeStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${start.hour.toString().padStart(2, '0')}:${start.minute.toString().padStart(2, '0')}:00`;
+  const endTimeStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${end.hour.toString().padStart(2, '0')}:${end.minute.toString().padStart(2, '0')}:00`;
+  
+  // Create Date objects in local time
+  const startDate = new Date(startTimeStr);
+  const endDate = new Date(endTimeStr);
+  
+  // Get timezone offset for the target timezone
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: config.timeRange.timezone,
+    timeZoneName: 'short'
+  });
+  
+  // Calculate the offset (this is approximate, for production use a proper timezone library)
+  const tzOffset = getTimezoneOffset(config.timeRange.timezone, now);
+  
+  // Convert to UTC timestamps
+  const startTimestamp = startDate.getTime() + tzOffset;
+  const endTimestamp = endDate.getTime() + tzOffset;
+  
+  // Don't go into the future
+  const finalEnd = Math.min(endTimestamp, Date.now());
+  
+  return {
+    start: startTimestamp,
+    end: finalEnd,
+    configured: `${config.timeRange.start} - ${config.timeRange.end} ${config.timeRange.timezone}`
+  };
+}
+
+// Get approximate timezone offset in milliseconds
+function getTimezoneOffset(timezone, date) {
+  // Get the date in the target timezone
+  const tzDate = new Date(date.toLocaleString('en-US', { timeZone: timezone }));
+  // Get the date in UTC
+  const utcDate = new Date(date.toLocaleString('en-US', { timeZone: 'UTC' }));
+  // Return the difference
+  return utcDate.getTime() - tzDate.getTime();
 }
 
 // Get business hours window for today in UTC milliseconds
@@ -102,21 +199,19 @@ function getBusinessHoursWindow() {
   const [month, day, year] = todayStr.split('/');
   
   // Create start and end times in business timezone
-  const startTimeStr = `${month}/${day}/${year} ${config.businessHours.startHour}:00:00`;
-  const endTimeStr = `${month}/${day}/${year} ${config.businessHours.endHour}:00:00`;
+  const startTimeStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${config.businessHours.startHour.toString().padStart(2, '0')}:00:00`;
+  const endTimeStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${config.businessHours.endHour.toString().padStart(2, '0')}:00:00`;
   
-  // Convert to Date objects (these will be in local time initially)
-  const startLocal = new Date(startTimeStr);
-  const endLocal = new Date(endTimeStr);
+  // Create Date objects
+  const startDate = new Date(startTimeStr);
+  const endDate = new Date(endTimeStr);
   
-  // Calculate timezone offset
-  const tzOffsetMinutes = getTzOffset(config.businessHours.timezone, now);
-  const localOffsetMinutes = now.getTimezoneOffset();
-  const offsetDiff = (localOffsetMinutes - tzOffsetMinutes) * 60 * 1000;
+  // Get timezone offset
+  const tzOffset = getTimezoneOffset(config.businessHours.timezone, now);
   
   // Convert to UTC timestamps
-  const startTimestamp = startLocal.getTime() - offsetDiff;
-  const endTimestamp = endLocal.getTime() - offsetDiff;
+  const startTimestamp = startDate.getTime() + tzOffset;
+  const endTimestamp = endDate.getTime() + tzOffset;
   
   // Make sure end doesn't go into the future
   const finalEnd = Math.min(endTimestamp, Date.now());
@@ -129,49 +224,11 @@ function getBusinessHoursWindow() {
   };
 }
 
-// Get timezone offset in minutes for a specific timezone
-function getTzOffset(timezone, date) {
-  // Create a date string in the target timezone
-  const tzString = date.toLocaleString('en-US', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  });
-  
-  // Parse the timezone date
-  const [datePart, timePart] = tzString.split(', ');
-  const [month, day, year] = datePart.split('/');
-  const [hour, minute, second] = timePart.split(':');
-  
-  // Create a date in the target timezone
-  const tzDate = new Date(`${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${hour}:${minute}:${second}`);
-  
-  // Calculate the offset
-  const utcDate = new Date(date.toISOString());
-  const diff = tzDate.getTime() - utcDate.getTime();
-  
-  // Return offset in minutes (positive means behind UTC)
-  return Math.round(diff / 60000);
-}
-
-// Get start of current day in milliseconds (in business timezone)
+// Get start of current day in milliseconds
 function getStartOfToday() {
   const now = new Date();
-  
-  if (config.businessHours.enabled) {
-    // Use business hours start time
-    const window = getBusinessHoursWindow();
-    return window.start;
-  } else {
-    // Midnight today in local timezone
-    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    return startOfDay.getTime();
-  }
+  const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  return startOfDay.getTime();
 }
 
 // Dialpad API client
@@ -389,25 +446,6 @@ function formatDuration(ms) {
   return Math.floor((ms || 0) / 1000);
 }
 
-// Check if a call is within business hours
-function isWithinBusinessHours(callTimestamp) {
-  if (!config.businessHours.enabled) {
-    return true; // If business hours filtering is disabled, include all calls
-  }
-  
-  // Convert call timestamp to business timezone to check hour
-  const callDate = new Date(callTimestamp);
-  const tzString = callDate.toLocaleString('en-US', { 
-    timeZone: config.businessHours.timezone,
-    hour: 'numeric',
-    hour12: false
-  });
-  
-  const businessHour = parseInt(tzString);
-  
-  return businessHour >= config.businessHours.startHour && businessHour < config.businessHours.endHour;
-}
-
 // Main sync function
 async function sync() {
   logger.info('Starting sync...');
@@ -448,7 +486,20 @@ async function sync() {
     let startedAfter;
     let startedBefore = now;
     
-    if (config.sync.realtimeOnly || config.sync.daysBack === 0) {
+    // Use specific time range if configured
+    if (hasTimeRangeConfig()) {
+      const timeWindow = getTimeRangeWindow();
+      startedAfter = timeWindow.start;
+      startedBefore = timeWindow.end;
+      
+      logger.info({
+        timeRange: timeWindow.configured,
+        windowStart: new Date(timeWindow.start).toISOString(),
+        windowEnd: new Date(timeWindow.end).toISOString(),
+        note: 'Using specific time range configuration'
+      }, 'Time range window set');
+      
+    } else if (config.sync.realtimeOnly || config.sync.daysBack === 0) {
       // Real-time mode with business hours
       if (config.businessHours.enabled) {
         const businessWindow = getBusinessHoursWindow();
@@ -464,26 +515,10 @@ async function sync() {
         // Don't sync beyond business hours end or current time
         startedBefore = Math.min(businessWindow.end, now);
         
-        // Check if we're before business hours have started
-        if (businessWindow.start > now) {
-          logger.info('Business hours have not started yet today. No calls to sync.');
-          return {
-            success: true,
-            totalCalls: 0,
-            matchedCalls: 0,
-            unmatchedCalls: 0,
-            filteredOutCalls: 0,
-            pagesProcessed: 0,
-            note: 'Business hours not started yet'
-          };
-        }
-        
         logger.info({
           businessHours: `${config.businessHours.startHour}:00 - ${config.businessHours.endHour}:00 ${config.businessHours.timezone}`,
           isWithinBusinessHours: businessWindow.isWithinBusinessHours,
-          currentHour: businessWindow.currentHour,
-          windowStart: new Date(businessWindow.start).toISOString(),
-          windowEnd: new Date(businessWindow.end).toISOString()
+          currentHour: businessWindow.currentHour
         }, 'Business hours configuration');
         
       } else {
@@ -518,15 +553,13 @@ async function sync() {
         totalCalls: 0,
         matchedCalls: 0,
         unmatchedCalls: 0,
-        filteredOutCalls: 0,
         pagesProcessed: 0,
-        note: 'No valid time window'
+        note: 'No valid time window - check your time range configuration'
       };
     }
     
     logger.info({
-      mode: config.sync.realtimeOnly ? 'Real-time' : 'Historical',
-      businessHoursEnabled: config.businessHours.enabled,
+      mode: hasTimeRangeConfig() ? 'Specific Time Range' : (config.sync.realtimeOnly ? 'Real-time' : 'Historical'),
       lastSynced: lastSyncedMs > 0 ? new Date(lastSyncedMs).toISOString() : 'Never',
       startedAfter: new Date(startedAfter).toISOString(),
       startedBefore: new Date(startedBefore).toISOString(),
@@ -537,7 +570,6 @@ async function sync() {
     let cursor = null;
     let totalCalls = 0;
     let matchedCalls = 0;
-    let filteredOutCalls = 0;
     let pageCount = 0;
     const maxPages = 200; // Safety limit (200 pages * 50 records = 10,000 calls max)
 
@@ -576,14 +608,6 @@ async function sync() {
         // Parse call data based on actual Dialpad API structure
         const callId = call.id || call.call_id || `${call.date_started}_${call.external_number}`;
         const startTime = parseInt(call.date_started); // Already in milliseconds
-        
-        // Filter by business hours if enabled
-        if (config.businessHours.enabled && !isWithinBusinessHours(startTime)) {
-          filteredOutCalls++;
-          logger.debug(`Call ${callId} filtered out - outside business hours`);
-          continue;
-        }
-        
         const endTime = call.date_ended ? parseInt(call.date_ended) : null;
         const duration = formatDuration(call.duration); // Convert to seconds
         const externalNumber = call.external_number;
@@ -602,7 +626,7 @@ async function sync() {
           'End Time': endTime ? new Date(endTime).toISOString() : null,
           // Optional: Add separate field for EDT display (you can add this field in Airtable)
           'Start Time (EDT)': new Date(startTime).toLocaleString('en-US', { 
-            timeZone: config.businessHours.timezone || 'America/New_York',
+            timeZone: config.timeRange.timezone || config.businessHours.timezone || 'America/New_York',
             year: 'numeric',
             month: '2-digit',
             day: '2-digit',
@@ -671,7 +695,6 @@ async function sync() {
         progress: {
           pagesProcessed: pageCount,
           totalCallsProcessed: totalCalls,
-          filteredOut: filteredOutCalls,
           matchedSoFar: matchedCalls,
           hasMore: !!cursor
         }
@@ -680,14 +703,13 @@ async function sync() {
     } while (cursor);
 
     // Final summary
-    if (totalCalls === 0 && filteredOutCalls === 0) {
+    if (totalCalls === 0) {
       logger.info('No new calls to sync for the specified time period');
     } else {
       logger.info({
         totalCalls,
         matchedCalls,
         unmatchedCalls: totalCalls - matchedCalls,
-        filteredOutByBusinessHours: filteredOutCalls,
         matchRate: totalCalls > 0 ? (matchedCalls / totalCalls * 100).toFixed(2) + '%' : 'N/A',
         pagesProcessed: pageCount
       }, 'Sync completed successfully');
@@ -698,7 +720,6 @@ async function sync() {
       totalCalls,
       matchedCalls,
       unmatchedCalls: totalCalls - matchedCalls,
-      filteredOutCalls,
       pagesProcessed: pageCount
     };
 
