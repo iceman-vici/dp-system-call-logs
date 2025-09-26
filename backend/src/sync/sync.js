@@ -30,7 +30,8 @@ const config = {
     phoneField: process.env.SECONDARY_PHONE_FIELD || 'Phone Format',
     lastCallField: process.env.SECONDARY_LAST_CALL_FIELD || 'Dialpad Last Connected Call Date',
     durationField: process.env.SECONDARY_DURATION_FIELD || 'Dialpad Call Length',
-    recordingField: process.env.SECONDARY_RECORDING_FIELD || 'DP Connected Last Call Audio'
+    recordingField: process.env.SECONDARY_RECORDING_FIELD || 'DP Connected Last Call Audio',
+    countField: process.env.SECONDARY_COUNT_FIELD || 'Dialpad_Connected_Count'
   },
   fields: {
     customerPhone: process.env.CUSTOMER_PHONE_FIELD || 'Phone',
@@ -127,6 +128,7 @@ function validateConfig() {
       lastCallField: config.secondaryAirtable.lastCallField,
       durationField: config.secondaryAirtable.durationField,
       recordingField: config.secondaryAirtable.recordingField,
+      countField: config.secondaryAirtable.countField,
       usingSharedPAT: config.secondaryAirtable.pat === config.airtable.pat
     }, 'Secondary Airtable config');
   }
@@ -582,23 +584,33 @@ class SecondaryAirtableClient {
     }
   }
 
-  async updateCallDetails(recordId, dateConnected, durationFormatted, recordingUrl) {
+  async updateCallDetailsWithCount(recordId, record, dateConnected, durationFormatted, recordingUrl) {
     try {
+      // Get current count from the record, handle null/undefined/blank values
+      const currentCount = record.fields[config.secondaryAirtable.countField];
+      const countValue = (currentCount === null || currentCount === undefined || currentCount === '') ? 0 : parseInt(currentCount) || 0;
+      const newCount = countValue + 1;
+      
       logger.info({
         recordId,
+        currentCount,
+        countValue,
+        newCount,
         dateConnected,
         durationFormatted,
         recordingUrl: recordingUrl ? 'present' : 'none',
         fields: {
           lastCallField: config.secondaryAirtable.lastCallField,
           durationField: config.secondaryAirtable.durationField,
-          recordingField: config.secondaryAirtable.recordingField
+          recordingField: config.secondaryAirtable.recordingField,
+          countField: config.secondaryAirtable.countField
         }
-      }, 'Updating call details in secondary base');
+      }, 'Updating call details with count in secondary base');
       
       const updateFields = {
         [config.secondaryAirtable.lastCallField]: dateConnected,
-        [config.secondaryAirtable.durationField]: durationFormatted
+        [config.secondaryAirtable.durationField]: durationFormatted,
+        [config.secondaryAirtable.countField]: newCount
       };
       
       // Only add recording URL if it exists
@@ -620,8 +632,10 @@ class SecondaryAirtableClient {
         recordId,
         dateConnected,
         durationFormatted,
-        hasRecording: !!recordingUrl
-      }, 'Successfully updated call details');
+        hasRecording: !!recordingUrl,
+        previousCount: countValue,
+        newCount
+      }, 'Successfully updated call details with incremented count');
       
       return true;
     } catch (error) {
@@ -629,7 +643,7 @@ class SecondaryAirtableClient {
         recordId,
         error: error.message,
         errorData: error.response?.data
-      }, 'Failed to update call details in secondary base');
+      }, 'Failed to update call details with count in secondary base');
       return false;
     }
   }
@@ -1059,9 +1073,10 @@ async function sync() {
           const record = await secondaryAirtable.findRecordByPhone(phoneNumber);
           
           if (record) {
-            // Update the last call date, duration, AND recording share link
-            const updated = await secondaryAirtable.updateCallDetails(
-              record.id, 
+            // Update the last call date, duration, recording share link, AND increment count
+            const updated = await secondaryAirtable.updateCallDetailsWithCount(
+              record.id,
+              record, // Pass the whole record to access current count
               callData.dateConnected,
               durationFormatted,
               shareLink
@@ -1077,7 +1092,7 @@ async function sync() {
                 hasRecording: !!shareLink,
                 direction: 'outbound',
                 success: true
-              }, 'Updated secondary base record with all call details');
+              }, 'Updated secondary base record with all call details and incremented count');
             }
           } else {
             logger.warn({
@@ -1093,7 +1108,7 @@ async function sync() {
         }
       }
       
-      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls with all details)`);
+      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls with all details and counts)`);
     } else if (!secondaryAirtable) {
       logger.info('Secondary Airtable not configured');
     } else if (latestOutboundCalls.size === 0) {
