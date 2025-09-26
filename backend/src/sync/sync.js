@@ -5,10 +5,7 @@ const retry = require('./retry');
 const state = require('./state');
 
 const logger = pino({
-  level: process.env.LOG_LEVEL || 'info',
-  transport: {
-    target: 'pino-pretty'
-  }
+  level: process.env.LOG_LEVEL || 'info'
 });
 
 // Configuration
