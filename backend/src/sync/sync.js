@@ -24,6 +24,7 @@ const config = {
   },
   secondaryAirtable: {
     enabled: !!(process.env.SECONDARY_AIRTABLE_BASE_ID && process.env.SECONDARY_AIRTABLE_TABLE),
+    pat: process.env.SECONDARY_AIRTABLE_PAT || process.env.AIRTABLE_PAT, // Can use same PAT if not provided
     baseId: process.env.SECONDARY_AIRTABLE_BASE_ID,
     table: process.env.SECONDARY_AIRTABLE_TABLE,
     phoneField: process.env.SECONDARY_PHONE_FIELD || 'Phone Format',
@@ -113,12 +114,16 @@ function validateConfig() {
   
   // Log secondary Airtable config if enabled
   if (config.secondaryAirtable.enabled) {
+    if (!config.secondaryAirtable.pat) {
+      throw new Error('Secondary Airtable base is configured but SECONDARY_AIRTABLE_PAT is missing');
+    }
     logger.info('Secondary Airtable base configured for client database updates');
     logger.debug({
       baseId: config.secondaryAirtable.baseId,
       table: config.secondaryAirtable.table,
       phoneField: config.secondaryAirtable.phoneField,
-      lastCallField: config.secondaryAirtable.lastCallField
+      lastCallField: config.secondaryAirtable.lastCallField,
+      usingSharedPAT: config.secondaryAirtable.pat === config.airtable.pat
     }, 'Secondary Airtable config');
   }
   
@@ -407,11 +412,30 @@ class SecondaryAirtableClient {
     this.axios = axios.create({
       baseURL: `https://api.airtable.com/v0/${config.secondaryAirtable.baseId}`,
       headers: {
-        'Authorization': `Bearer ${config.airtable.pat}`, // Use same PAT
+        'Authorization': `Bearer ${config.secondaryAirtable.pat}`,
         'Content-Type': 'application/json'
       },
       timeout: 30000
     });
+  }
+
+  async testConnection() {
+    try {
+      const response = await this.axios.get(
+        `/${encodeURIComponent(config.secondaryAirtable.table)}`,
+        { params: { maxRecords: 1 } }
+      );
+      logger.info('Secondary Airtable connection successful');
+      return true;
+    } catch (error) {
+      logger.error('Secondary Airtable connection failed:', error.message);
+      if (error.response?.status === 401) {
+        throw new Error('Invalid Secondary Airtable PAT. Please check your credentials.');
+      } else if (error.response?.status === 404) {
+        throw new Error('Secondary Airtable base or table not found. Check your base ID and table name.');
+      }
+      throw error;
+    }
   }
 
   async findRecordByPhone(phoneNumber) {
@@ -500,6 +524,11 @@ async function sync() {
     logger.info('Testing API connections...');
     await dialpad.testConnection();
     await airtable.testConnection();
+    
+    if (secondaryAirtable) {
+      await secondaryAirtable.testConnection();
+    }
+    
     logger.info('API connections verified');
 
     // Get customers from Airtable
