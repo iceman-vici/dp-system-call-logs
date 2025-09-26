@@ -440,10 +440,19 @@ class SecondaryAirtableClient {
 
   async findRecordByPhone(phoneNumber) {
     try {
-      // Search for record with matching phone number
-      const filterFormula = `{${config.secondaryAirtable.phoneField}} = "${phoneNumber}"`;
+      // Clean the phone number - remove + sign and any formatting
+      const cleanPhone = phoneNumber.replace(/^\+/, '').replace(/[^0-9]/g, '');
       
-      const response = await this.axios.get(
+      // Try to find with exact match first
+      let filterFormula = `{${config.secondaryAirtable.phoneField}} = "${cleanPhone}"`;
+      
+      logger.debug({
+        originalPhone: phoneNumber,
+        cleanPhone: cleanPhone,
+        filterFormula
+      }, 'Searching for phone in secondary base');
+      
+      let response = await this.axios.get(
         `/${encodeURIComponent(config.secondaryAirtable.table)}`,
         {
           params: {
@@ -455,6 +464,49 @@ class SecondaryAirtableClient {
 
       if (response.data.records && response.data.records.length > 0) {
         return response.data.records[0];
+      }
+      
+      // If not found, also try with the original format (with +)
+      if (phoneNumber.startsWith('+')) {
+        filterFormula = `{${config.secondaryAirtable.phoneField}} = "${phoneNumber}"`;
+        
+        response = await this.axios.get(
+          `/${encodeURIComponent(config.secondaryAirtable.table)}`,
+          {
+            params: {
+              filterByFormula: filterFormula,
+              maxRecords: 1
+            }
+          }
+        );
+        
+        if (response.data.records && response.data.records.length > 0) {
+          return response.data.records[0];
+        }
+      }
+      
+      // Also try without country code (last 10 digits)
+      if (cleanPhone.length > 10) {
+        const last10Digits = cleanPhone.slice(-10);
+        filterFormula = `{${config.secondaryAirtable.phoneField}} = "${last10Digits}"`;
+        
+        response = await this.axios.get(
+          `/${encodeURIComponent(config.secondaryAirtable.table)}`,
+          {
+            params: {
+              filterByFormula: filterFormula,
+              maxRecords: 1
+            }
+          }
+        );
+        
+        if (response.data.records && response.data.records.length > 0) {
+          logger.debug({
+            phoneNumber,
+            matchedWith: last10Digits
+          }, 'Found record with 10-digit match');
+          return response.data.records[0];
+        }
       }
       
       return null;
