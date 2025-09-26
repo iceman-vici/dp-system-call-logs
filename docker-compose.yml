@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dp-logs-backend
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend/state:/app/state
+      - ./backend/logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - dp-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - REACT_APP_API_URL=http://backend:3001
+        - REACT_APP_WS_URL=ws://backend:3001
+    container_name: dp-logs-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - dp-network
+
+networks:
+  dp-network:
+    driver: bridge
+
+volumes:
+  state-data:
+  logs-data:
