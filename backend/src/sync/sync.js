@@ -588,7 +588,7 @@ class SecondaryAirtableClient {
     try {
       // Get current count from the record, handle null/undefined/blank values
       const currentCount = record.fields[config.secondaryAirtable.countField];
-      const countValue = (currentCount === null || currentCount === undefined || currentCount === '') ? 0 : parseInt(currentCount) || 0;
+      const countValue = (currentCount === null || currentCount === undefined || currentCount === '' || currentCount === 0) ? 0 : parseInt(currentCount) || 0;
       const newCount = countValue + 1;
       
       logger.info({
@@ -604,19 +604,36 @@ class SecondaryAirtableClient {
           durationField: config.secondaryAirtable.durationField,
           recordingField: config.secondaryAirtable.recordingField,
           countField: config.secondaryAirtable.countField
+        },
+        fieldValues: {
+          [config.secondaryAirtable.lastCallField]: dateConnected,
+          [config.secondaryAirtable.durationField]: durationFormatted,
+          [config.secondaryAirtable.countField]: newCount,
+          [config.secondaryAirtable.recordingField]: recordingUrl || undefined
         }
       }, 'Updating call details with count in secondary base');
       
       const updateFields = {
         [config.secondaryAirtable.lastCallField]: dateConnected,
-        [config.secondaryAirtable.durationField]: durationFormatted,
-        [config.secondaryAirtable.countField]: newCount
+        [config.secondaryAirtable.durationField]: durationFormatted
       };
+      
+      // Only add count field if it's configured and not empty
+      if (config.secondaryAirtable.countField && config.secondaryAirtable.countField.trim() !== '') {
+        updateFields[config.secondaryAirtable.countField] = newCount;
+      }
       
       // Only add recording URL if it exists
       if (recordingUrl) {
         updateFields[config.secondaryAirtable.recordingField] = recordingUrl;
       }
+      
+      // Log the exact payload being sent
+      logger.debug({
+        recordId,
+        updateFields,
+        fieldsBeingSent: Object.keys(updateFields)
+      }, 'Exact update payload');
       
       await this.axios.patch(
         `/${encodeURIComponent(config.secondaryAirtable.table)}`,
@@ -642,8 +659,68 @@ class SecondaryAirtableClient {
       logger.error({
         recordId,
         error: error.message,
-        errorData: error.response?.data
+        errorData: error.response?.data,
+        attemptedFields: {
+          [config.secondaryAirtable.lastCallField]: dateConnected,
+          [config.secondaryAirtable.durationField]: durationFormatted,
+          [config.secondaryAirtable.countField]: 'attempted to set count',
+          [config.secondaryAirtable.recordingField]: recordingUrl ? 'had URL' : 'no URL'
+        }
       }, 'Failed to update call details with count in secondary base');
+      
+      // If the count field is causing issues, try updating without it
+      if (error.response?.data?.error?.message?.includes('Dialpad_Connected_Count')) {
+        logger.warn('Count field error detected, attempting update without count field');
+        return await this.updateCallDetailsWithoutCount(recordId, dateConnected, durationFormatted, recordingUrl);
+      }
+      
+      return false;
+    }
+  }
+  
+  async updateCallDetailsWithoutCount(recordId, dateConnected, durationFormatted, recordingUrl) {
+    try {
+      logger.info({
+        recordId,
+        dateConnected,
+        durationFormatted,
+        recordingUrl: recordingUrl ? 'present' : 'none'
+      }, 'Updating call details WITHOUT count (fallback)');
+      
+      const updateFields = {
+        [config.secondaryAirtable.lastCallField]: dateConnected,
+        [config.secondaryAirtable.durationField]: durationFormatted
+      };
+      
+      // Only add recording URL if it exists
+      if (recordingUrl) {
+        updateFields[config.secondaryAirtable.recordingField] = recordingUrl;
+      }
+      
+      await this.axios.patch(
+        `/${encodeURIComponent(config.secondaryAirtable.table)}`,
+        {
+          records: [{
+            id: recordId,
+            fields: updateFields
+          }]
+        }
+      );
+      
+      logger.info({
+        recordId,
+        dateConnected,
+        durationFormatted,
+        hasRecording: !!recordingUrl
+      }, 'Successfully updated call details (without count)');
+      
+      return true;
+    } catch (error) {
+      logger.error({
+        recordId,
+        error: error.message,
+        errorData: error.response?.data
+      }, 'Failed to update call details even without count');
       return false;
     }
   }
