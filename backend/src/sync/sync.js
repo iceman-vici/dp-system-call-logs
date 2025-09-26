@@ -28,7 +28,8 @@ const config = {
   sync: {
     daysBack: parseInt(process.env.DAYS_BACK || '14'),
     backfillGraceSeconds: parseInt(process.env.BACKFILL_GRACE_SECONDS || '21600'),
-    defaultRegion: process.env.DEFAULT_REGION || 'SG'
+    defaultRegion: process.env.DEFAULT_REGION || 'SG',
+    pageSize: parseInt(process.env.PAGE_SIZE || '100')
   }
 };
 
@@ -47,46 +48,54 @@ function validateConfig() {
   }
 }
 
-// Dialpad API client
+// Dialpad API client - Updated to match actual API
 class DialpadClient {
   constructor() {
     this.axios = axios.create({
       baseURL: config.dialpad.baseUrl,
       headers: {
-        'Authorization': `Bearer ${config.dialpad.apiKey}`,
-        'Accept': 'application/json'
+        'accept': 'application/json',
+        'authorization': `Bearer ${config.dialpad.apiKey}`
       },
       timeout: 30000
     });
   }
 
   async getCompanyNumbers() {
-    const response = await retry(
-      () => this.axios.get('/api/v2/company/numbers'),
-      'Dialpad getCompanyNumbers'
-    );
-    return response.data.items || [];
+    // This endpoint might be different, keeping for compatibility
+    try {
+      const response = await retry(
+        () => this.axios.get('/api/v2/company/numbers'),
+        'Dialpad getCompanyNumbers'
+      );
+      return response.data.items || [];
+    } catch (error) {
+      logger.warn('Could not fetch company numbers, will process all calls');
+      return [];
+    }
   }
 
-  async getCalls(since, cursor = null) {
+  async getCalls(startedAfter, startedBefore, cursor = null) {
     const params = {
-      order: 'desc',
-      limit: 100,
-      start_time: since
+      started_after: startedAfter, // Milliseconds timestamp
+      started_before: startedBefore, // Milliseconds timestamp
+      limit: config.sync.pageSize
     };
     
     if (cursor) {
       params.cursor = cursor;
     }
 
+    logger.debug({ params }, 'Fetching calls with params');
+
     const response = await retry(
-      () => this.axios.get('/api/v2/calls', { params }),
+      () => this.axios.get('/api/v2/call', { params }),
       'Dialpad getCalls'
     );
     
     return {
       items: response.data.items || [],
-      cursor: response.data.cursor
+      cursor: response.data.cursor || null
     };
   }
 }
@@ -160,6 +169,7 @@ class AirtableClient {
 // Phone number normalization
 function normalizePhone(number, defaultRegion = config.sync.defaultRegion) {
   try {
+    if (!number) return null;
     const parsed = parsePhoneNumber(number, defaultRegion);
     return parsed ? parsed.format('E.164') : null;
   } catch (error) {
@@ -168,7 +178,12 @@ function normalizePhone(number, defaultRegion = config.sync.defaultRegion) {
   }
 }
 
-// Main sync function
+// Format duration from milliseconds to seconds
+function formatDuration(ms) {
+  return Math.floor((ms || 0) / 1000);
+}
+
+// Main sync function - Updated to match Dialpad API v2
 async function sync() {
   logger.info('Starting sync...');
   
@@ -178,26 +193,31 @@ async function sync() {
     const dialpad = new DialpadClient();
     const airtable = new AirtableClient();
 
-    // Get company numbers
+    // Get company numbers if available
     logger.info('Fetching company numbers...');
     const companyNumbers = await dialpad.getCompanyNumbers();
     const companyNumbersSet = new Set(
-      companyNumbers.map(n => normalizePhone(n.phone_number)).filter(Boolean)
+      companyNumbers.map(n => normalizePhone(n.phone_number || n.number)).filter(Boolean)
     );
     logger.info(`Found ${companyNumbersSet.size} company numbers`);
 
     // Determine sync window
-    const lastSyncedEpochS = await state.getLastSynced();
-    const now = Math.floor(Date.now() / 1000);
-    const daysBackSeconds = config.sync.daysBack * 24 * 60 * 60;
-    const since = Math.max(
-      now - daysBackSeconds,
-      lastSyncedEpochS - config.sync.backfillGraceSeconds
+    const lastSyncedMs = (await state.getLastSynced()) * 1000; // Convert to ms
+    const now = Date.now();
+    const daysBackMs = config.sync.daysBack * 24 * 60 * 60 * 1000;
+    const backfillGraceMs = config.sync.backfillGraceSeconds * 1000;
+    
+    // Use milliseconds for Dialpad API
+    const startedAfter = Math.max(
+      now - daysBackMs,
+      lastSyncedMs - backfillGraceMs
     );
+    const startedBefore = now;
     
     logger.info({
-      lastSynced: new Date(lastSyncedEpochS * 1000).toISOString(),
-      syncSince: new Date(since * 1000).toISOString()
+      lastSynced: new Date(lastSyncedMs).toISOString(),
+      startedAfter: new Date(startedAfter).toISOString(),
+      startedBefore: new Date(startedBefore).toISOString()
     }, 'Sync window determined');
 
     // Get customers from Airtable
@@ -220,63 +240,79 @@ async function sync() {
     let cursor = null;
     let totalCalls = 0;
     let matchedCalls = 0;
-    let stopProcessing = false;
+    let pageCount = 0;
+    const maxPages = 100; // Safety limit
 
     do {
-      logger.info('Fetching calls page...');
-      const { items: calls, cursor: nextCursor } = await dialpad.getCalls(since, cursor);
+      pageCount++;
+      logger.info(`Fetching calls page ${pageCount}...`);
+      
+      const { items: calls, cursor: nextCursor } = await dialpad.getCalls(
+        startedAfter,
+        startedBefore,
+        cursor
+      );
       
       if (calls.length === 0) {
         logger.info('No more calls to process');
         break;
       }
 
+      logger.info(`Processing ${calls.length} calls from page ${pageCount}`);
       const callsToUpsert = [];
 
       for (const call of calls) {
-        // Check if we've reached our cutoff
-        if (call.start_time < since) {
-          stopProcessing = true;
-          break;
-        }
-
-        // Normalize phone numbers
-        const fromNormalized = normalizePhone(call.from_number);
-        const toNormalized = normalizePhone(call.to_number);
-
-        // Determine customer phone (other party)
-        let customerPhone = null;
-        let direction = null;
+        // Parse call data based on actual Dialpad API structure
+        const callId = call.id || call.call_id || `${call.date_started}_${call.external_number}`;
+        const startTime = parseInt(call.date_started); // Already in milliseconds
+        const endTime = call.date_ended ? parseInt(call.date_ended) : null;
+        const duration = formatDuration(call.duration); // Convert to seconds
+        const externalNumber = call.external_number;
+        const direction = call.direction; // 'inbound' or 'outbound'
         
-        if (fromNormalized && companyNumbersSet.has(fromNormalized)) {
-          customerPhone = toNormalized;
-          direction = 'Outbound';
-        } else if (toNormalized && companyNumbersSet.has(toNormalized)) {
-          customerPhone = fromNormalized;
-          direction = 'Inbound';
-        } else {
-          // Neither number is ours, skip
-          logger.debug({ call }, 'Skipping call - no company number involved');
-          continue;
+        // Normalize phone number
+        const normalizedPhone = normalizePhone(externalNumber);
+        
+        // Determine if this is a company number
+        let customerPhone = normalizedPhone;
+        let isInternalCall = false;
+        
+        if (companyNumbersSet.size > 0 && normalizedPhone) {
+          isInternalCall = companyNumbersSet.has(normalizedPhone);
+          if (isInternalCall) {
+            // Skip internal calls
+            logger.debug({ call: callId }, 'Skipping internal call');
+            continue;
+          }
         }
 
-        // Build call record
+        // Build call record for Airtable
         const callRecord = {
-          'Call ID': call.id,
-          'From': call.from_number,
-          'To': call.to_number,
-          'Start Time': new Date(call.start_time * 1000).toISOString(),
-          'End Time': call.end_time ? new Date(call.end_time * 1000).toISOString() : null,
-          'Duration (s)': call.duration || 0,
-          'Direction': direction
+          'Call ID': callId,
+          'External Number': externalNumber,
+          'Direction': direction === 'inbound' ? 'Inbound' : 'Outbound',
+          'Start Time': new Date(startTime).toISOString(),
+          'End Time': endTime ? new Date(endTime).toISOString() : null,
+          'Duration (s)': duration,
+          'Contact Name': call.contact?.name || 'Unknown',
+          'Target': call.target?.name || 'N/A',
+          'Was Recorded': call.was_recorded || false,
+          'MOS Score': call.mos_score || null
         };
+
+        // Add recording URL if available
+        if (call.recording_url && call.recording_url.length > 0) {
+          callRecord['Recording URL'] = call.recording_url[0];
+        } else if (call.admin_recording_urls && call.admin_recording_urls.length > 0) {
+          callRecord['Recording URL'] = call.admin_recording_urls[0];
+        }
 
         // Match to customer
         if (customerPhone && customerPhoneMap.has(customerPhone)) {
           callRecord[config.fields.callsCustomerLink] = [customerPhoneMap.get(customerPhone)];
           matchedCalls++;
         } else if (config.fields.callsUnmatchedPhone) {
-          callRecord[config.fields.callsUnmatchedPhone] = customerPhone || 'Unknown';
+          callRecord[config.fields.callsUnmatchedPhone] = customerPhone || externalNumber || 'Unknown';
         }
 
         callsToUpsert.push(callRecord);
@@ -290,23 +326,31 @@ async function sync() {
       }
 
       // Update state after each page
-      await state.setLastSynced(now);
+      await state.setLastSynced(Math.floor(now / 1000)); // Save as seconds
       
       cursor = nextCursor;
-    } while (cursor && !stopProcessing);
+      
+      // Safety check
+      if (pageCount >= maxPages) {
+        logger.warn(`Reached maximum page limit (${maxPages}), stopping sync`);
+        break;
+      }
+    } while (cursor);
 
     logger.info({
       totalCalls,
       matchedCalls,
       unmatchedCalls: totalCalls - matchedCalls,
-      matchRate: totalCalls > 0 ? (matchedCalls / totalCalls * 100).toFixed(2) + '%' : 'N/A'
+      matchRate: totalCalls > 0 ? (matchedCalls / totalCalls * 100).toFixed(2) + '%' : 'N/A',
+      pagesProcessed: pageCount
     }, 'Sync completed successfully');
 
     return {
       success: true,
       totalCalls,
       matchedCalls,
-      unmatchedCalls: totalCalls - matchedCalls
+      unmatchedCalls: totalCalls - matchedCalls,
+      pagesProcessed: pageCount
     };
 
   } catch (error) {

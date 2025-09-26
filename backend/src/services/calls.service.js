@@ -1,9 +1,24 @@
 const axios = require('axios');
-const { parsePhoneNumber } = require('libphonenumber-js');
 
 class CallsService {
   constructor() {
+    this.dialpadClient = this.initDialpadClient();
     this.airtableClient = this.initAirtableClient();
+  }
+
+  initDialpadClient() {
+    if (!process.env.DIALPAD_API_KEY) {
+      return null;
+    }
+
+    return axios.create({
+      baseURL: process.env.DIALPAD_BASE_URL || 'https://dialpad.com',
+      headers: {
+        'accept': 'application/json',
+        'authorization': `Bearer ${process.env.DIALPAD_API_KEY}`
+      },
+      timeout: 30000
+    });
   }
 
   initAirtableClient() {
@@ -22,10 +37,6 @@ class CallsService {
   }
 
   async getCalls(options = {}) {
-    if (!this.airtableClient) {
-      throw new Error('Airtable not configured');
-    }
-
     const {
       page = 1,
       limit = 50,
@@ -36,71 +47,144 @@ class CallsService {
       endDate
     } = options;
 
-    try {
-      // Build filter formula
-      const filters = [];
-      
-      if (search) {
-        filters.push(`OR(SEARCH("${search}", From), SEARCH("${search}", To))`);
+    // First try to get from Airtable
+    if (this.airtableClient) {
+      try {
+        return await this.getCallsFromAirtable(options);
+      } catch (error) {
+        console.error('Failed to get calls from Airtable:', error);
       }
-      
-      if (direction) {
-        filters.push(`Direction = "${direction}"`);
-      }
-      
-      if (matched === true) {
-        filters.push('NOT({Customer} = "")');
-      } else if (matched === false) {
-        filters.push('{Customer} = ""');
-      }
-      
-      if (startDate) {
-        filters.push(`{Start Time} >= "${startDate}"`);
-      }
-      
-      if (endDate) {
-        filters.push(`{Start Time} <= "${endDate}"`);
-      }
-
-      const filterFormula = filters.length > 0 ? `AND(${filters.join(', ')})` : '';
-
-      // Make request to Airtable
-      const params = {
-        pageSize: limit,
-        sort: [{ field: 'Start Time', direction: 'desc' }]
-      };
-      
-      if (filterFormula) {
-        params.filterByFormula = filterFormula;
-      }
-
-      // Calculate offset for pagination
-      if (page > 1) {
-        // Note: Airtable uses offset-based pagination
-        // This is a simplified approach
-        params.offset = (page - 1) * limit;
-      }
-
-      const response = await this.airtableClient.get(
-        `/${encodeURIComponent(process.env.AIRTABLE_CALLS_TABLE || 'Calls')}`,
-        { params }
-      );
-
-      return {
-        data: response.data.records.map(record => ({
-          id: record.id,
-          ...record.fields
-        })),
-        pagination: {
-          page,
-          limit,
-          hasMore: !!response.data.offset
-        }
-      };
-    } catch (error) {
-      console.error('Error fetching calls:', error);
-      throw new Error('Failed to fetch calls');
     }
+
+    // Fallback to Dialpad direct API
+    if (this.dialpadClient && startDate && endDate) {
+      return await this.getCallsFromDialpad(options);
+    }
+
+    throw new Error('No data source configured');
+  }
+
+  async getCallsFromDialpad(options) {
+    const {
+      page = 1,
+      limit = 50,
+      startDate,
+      endDate,
+      direction
+    } = options;
+
+    // Convert dates to timestamps
+    const startedAfter = new Date(startDate).getTime();
+    const startedBefore = new Date(endDate).getTime();
+
+    const params = {
+      started_after: startedAfter,
+      started_before: startedBefore,
+      limit
+    };
+
+    const response = await this.dialpadClient.get('/api/v2/call', { params });
+    
+    // Transform Dialpad response to our format
+    const calls = (response.data.items || []).map(call => ({
+      id: call.id || call.call_id || `${call.date_started}_${call.external_number}`,
+      'Call ID': call.id || call.call_id,
+      'Direction': call.direction === 'inbound' ? 'Inbound' : 'Outbound',
+      'External Number': call.external_number,
+      'Contact Name': call.contact?.name || 'Unknown',
+      'Target': call.target?.name || 'N/A',
+      'Start Time': new Date(parseInt(call.date_started)).toISOString(),
+      'End Time': call.date_ended ? new Date(parseInt(call.date_ended)).toISOString() : null,
+      'Duration (s)': Math.floor((call.duration || 0) / 1000),
+      'Was Recorded': call.was_recorded || false,
+      'Recording URL': call.recording_url?.[0] || call.admin_recording_urls?.[0] || null,
+      'MOS Score': call.mos_score || null
+    }));
+
+    // Filter by direction if specified
+    const filteredCalls = direction 
+      ? calls.filter(c => c.Direction.toLowerCase() === direction.toLowerCase())
+      : calls;
+
+    return {
+      data: filteredCalls,
+      pagination: {
+        page,
+        limit,
+        hasMore: response.data.cursor ? true : false
+      }
+    };
+  }
+
+  async getCallsFromAirtable(options) {
+    const {
+      page = 1,
+      limit = 50,
+      search,
+      direction,
+      matched,
+      startDate,
+      endDate
+    } = options;
+
+    // Build filter formula
+    const filters = [];
+    
+    if (search) {
+      filters.push(`OR(SEARCH("${search}", {External Number}), SEARCH("${search}", {Contact Name}))`);
+    }
+    
+    if (direction) {
+      filters.push(`Direction = "${direction}"`);
+    }
+    
+    if (matched === true) {
+      filters.push('NOT({Customer} = "")');
+    } else if (matched === false) {
+      filters.push('{Customer} = ""');
+    }
+    
+    if (startDate) {
+      filters.push(`{Start Time} >= "${startDate}"`);
+    }
+    
+    if (endDate) {
+      filters.push(`{Start Time} <= "${endDate}"`);
+    }
+
+    const filterFormula = filters.length > 0 ? `AND(${filters.join(', ')})` : '';
+
+    // Make request to Airtable
+    const params = {
+      pageSize: limit,
+      sort: [{ field: 'Start Time', direction: 'desc' }]
+    };
+    
+    if (filterFormula) {
+      params.filterByFormula = filterFormula;
+    }
+
+    // Calculate offset for pagination
+    if (page > 1) {
+      params.offset = (page - 1) * limit;
+    }
+
+    const response = await this.airtableClient.get(
+      `/${encodeURIComponent(process.env.AIRTABLE_CALLS_TABLE || 'Calls')}`,
+      { params }
+    );
+
+    return {
+      data: response.data.records.map(record => ({
+        id: record.id,
+        ...record.fields
+      })),
+      pagination: {
+        page,
+        limit,
+        hasMore: !!response.data.offset
+      }
+    };
   }
 
   async getCallById(id) {
@@ -126,87 +210,86 @@ class CallsService {
   }
 
   async getCallStats(options = {}) {
-    if (!this.airtableClient) {
-      throw new Error('Airtable not configured');
-    }
-
     const { startDate, endDate } = options;
+    
+    // Get calls for the period
+    const response = await this.getCalls({
+      startDate,
+      endDate,
+      limit: 1000 // Get more records for stats
+    });
 
-    try {
-      // Build filter
-      const filters = [];
-      if (startDate) filters.push(`{Start Time} >= "${startDate}"`);
-      if (endDate) filters.push(`{Start Time} <= "${endDate}"`);
-      const filterFormula = filters.length > 0 ? `AND(${filters.join(', ')})` : '';
+    const calls = response.data;
+    
+    // Calculate statistics
+    const stats = {
+      totalCalls: calls.length,
+      totalDuration: 0,
+      inboundCalls: 0,
+      outboundCalls: 0,
+      matchedCalls: 0,
+      unmatchedCalls: 0,
+      averageDuration: 0,
+      recordedCalls: 0
+    };
 
-      // Fetch all calls for the period (simplified - in production, handle pagination)
-      const params = {
-        pageSize: 100,
-        fields: ['Duration (s)', 'Direction', 'Customer']
-      };
+    calls.forEach(call => {
+      const duration = call['Duration (s)'] || 0;
+      stats.totalDuration += duration;
       
-      if (filterFormula) {
-        params.filterByFormula = filterFormula;
+      if (call.Direction === 'Inbound') {
+        stats.inboundCalls++;
+      } else if (call.Direction === 'Outbound') {
+        stats.outboundCalls++;
       }
-
-      const response = await this.airtableClient.get(
-        `/${encodeURIComponent(process.env.AIRTABLE_CALLS_TABLE || 'Calls')}`,
-        { params }
-      );
-
-      const calls = response.data.records;
       
-      // Calculate statistics
-      const stats = {
-        totalCalls: calls.length,
-        totalDuration: 0,
-        inboundCalls: 0,
-        outboundCalls: 0,
-        matchedCalls: 0,
-        unmatchedCalls: 0,
-        averageDuration: 0
-      };
-
-      calls.forEach(call => {
-        const duration = call.fields['Duration (s)'] || 0;
-        stats.totalDuration += duration;
-        
-        if (call.fields.Direction === 'Inbound') {
-          stats.inboundCalls++;
-        } else if (call.fields.Direction === 'Outbound') {
-          stats.outboundCalls++;
-        }
-        
-        if (call.fields.Customer) {
-          stats.matchedCalls++;
-        } else {
-          stats.unmatchedCalls++;
-        }
-      });
-
-      if (stats.totalCalls > 0) {
-        stats.averageDuration = Math.round(stats.totalDuration / stats.totalCalls);
+      if (call.Customer) {
+        stats.matchedCalls++;
+      } else {
+        stats.unmatchedCalls++;
       }
+      
+      if (call['Was Recorded']) {
+        stats.recordedCalls++;
+      }
+    });
 
-      return stats;
-    } catch (error) {
-      console.error('Error fetching call stats:', error);
-      throw new Error('Failed to fetch call statistics');
+    if (stats.totalCalls > 0) {
+      stats.averageDuration = Math.round(stats.totalDuration / stats.totalCalls);
     }
+
+    return stats;
   }
 
   async exportCalls(filters = {}) {
     const calls = await this.getCalls({ ...filters, limit: 1000 });
     
     // Convert to CSV
-    const headers = ['Call ID', 'From', 'To', 'Start Time', 'Duration (s)', 'Direction', 'Customer'];
+    const headers = [
+      'Call ID',
+      'Direction', 
+      'Contact Name',
+      'External Number',
+      'Target',
+      'Start Time',
+      'Duration (s)',
+      'Was Recorded',
+      'Recording URL',
+      'MOS Score',
+      'Customer'
+    ];
+    
     const rows = calls.data.map(call => [
       call['Call ID'] || '',
-      call.From || '',
-      call.To || '',
+      call.Direction || '',
+      call['Contact Name'] || '',
+      call['External Number'] || '',
+      call.Target || '',
       call['Start Time'] || '',
       call['Duration (s)'] || '0',
-      call.Direction || '',
+      call['Was Recorded'] ? 'Yes' : 'No',
+      call['Recording URL'] || '',
+      call['MOS Score'] || '',
       call.Customer ? 'Matched' : 'Unmatched'
     ]);
 
