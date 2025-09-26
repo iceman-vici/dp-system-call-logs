@@ -31,7 +31,7 @@ const config = {
     lastCallField: process.env.SECONDARY_LAST_CALL_FIELD || 'Dialpad Last Connected Call Date',
     durationField: process.env.SECONDARY_DURATION_FIELD || 'Dialpad Call Length',
     recordingField: process.env.SECONDARY_RECORDING_FIELD || 'DP Connected Last Call Audio',
-    countField: process.env.SECONDARY_COUNT_FIELD || 'Dialpad_Connected_Count'
+    processedField: process.env.SECONDARY_PROCESSED_FIELD || 'Dialpad_Last_Processed'
   },
   fields: {
     customerPhone: process.env.CUSTOMER_PHONE_FIELD || 'Phone',
@@ -128,7 +128,7 @@ function validateConfig() {
       lastCallField: config.secondaryAirtable.lastCallField,
       durationField: config.secondaryAirtable.durationField,
       recordingField: config.secondaryAirtable.recordingField,
-      countField: config.secondaryAirtable.countField,
+      processedField: config.secondaryAirtable.processedField,
       usingSharedPAT: config.secondaryAirtable.pat === config.airtable.pat
     }, 'Secondary Airtable config');
   }
@@ -584,43 +584,33 @@ class SecondaryAirtableClient {
     }
   }
 
-  async updateCallDetailsWithCount(recordId, record, dateConnected, durationFormatted, recordingUrl) {
+  async updateCallDetailsWithTimestamp(recordId, dateConnected, durationFormatted, recordingUrl) {
     try {
-      // Get current count from the record, handle null/undefined/blank values
-      const currentCount = record.fields[config.secondaryAirtable.countField];
-      const countValue = (currentCount === null || currentCount === undefined || currentCount === '' || currentCount === 0) ? 0 : parseInt(currentCount) || 0;
-      const newCount = countValue + 1;
+      // Get current timestamp for when this record was processed
+      const processedTimestamp = new Date().toISOString();
       
       logger.info({
         recordId,
-        currentCount,
-        countValue,
-        newCount,
         dateConnected,
         durationFormatted,
         recordingUrl: recordingUrl ? 'present' : 'none',
+        processedTimestamp,
         fields: {
           lastCallField: config.secondaryAirtable.lastCallField,
           durationField: config.secondaryAirtable.durationField,
           recordingField: config.secondaryAirtable.recordingField,
-          countField: config.secondaryAirtable.countField
-        },
-        fieldValues: {
-          [config.secondaryAirtable.lastCallField]: dateConnected,
-          [config.secondaryAirtable.durationField]: durationFormatted,
-          [config.secondaryAirtable.countField]: newCount,
-          [config.secondaryAirtable.recordingField]: recordingUrl || undefined
+          processedField: config.secondaryAirtable.processedField
         }
-      }, 'Updating call details with count in secondary base');
+      }, 'Updating call details with processed timestamp in secondary base');
       
       const updateFields = {
         [config.secondaryAirtable.lastCallField]: dateConnected,
         [config.secondaryAirtable.durationField]: durationFormatted
       };
       
-      // Only add count field if it's configured and not empty
-      if (config.secondaryAirtable.countField && config.secondaryAirtable.countField.trim() !== '') {
-        updateFields[config.secondaryAirtable.countField] = newCount;
+      // Add processed timestamp field if configured
+      if (config.secondaryAirtable.processedField && config.secondaryAirtable.processedField.trim() !== '') {
+        updateFields[config.secondaryAirtable.processedField] = processedTimestamp;
       }
       
       // Only add recording URL if it exists
@@ -650,69 +640,8 @@ class SecondaryAirtableClient {
         dateConnected,
         durationFormatted,
         hasRecording: !!recordingUrl,
-        previousCount: countValue,
-        newCount
-      }, 'Successfully updated call details with incremented count');
-      
-      return true;
-    } catch (error) {
-      logger.error({
-        recordId,
-        error: error.message,
-        errorData: error.response?.data,
-        attemptedFields: {
-          [config.secondaryAirtable.lastCallField]: dateConnected,
-          [config.secondaryAirtable.durationField]: durationFormatted,
-          [config.secondaryAirtable.countField]: 'attempted to set count',
-          [config.secondaryAirtable.recordingField]: recordingUrl ? 'had URL' : 'no URL'
-        }
-      }, 'Failed to update call details with count in secondary base');
-      
-      // If the count field is causing issues, try updating without it
-      if (error.response?.data?.error?.message?.includes('Dialpad_Connected_Count')) {
-        logger.warn('Count field error detected, attempting update without count field');
-        return await this.updateCallDetailsWithoutCount(recordId, dateConnected, durationFormatted, recordingUrl);
-      }
-      
-      return false;
-    }
-  }
-  
-  async updateCallDetailsWithoutCount(recordId, dateConnected, durationFormatted, recordingUrl) {
-    try {
-      logger.info({
-        recordId,
-        dateConnected,
-        durationFormatted,
-        recordingUrl: recordingUrl ? 'present' : 'none'
-      }, 'Updating call details WITHOUT count (fallback)');
-      
-      const updateFields = {
-        [config.secondaryAirtable.lastCallField]: dateConnected,
-        [config.secondaryAirtable.durationField]: durationFormatted
-      };
-      
-      // Only add recording URL if it exists
-      if (recordingUrl) {
-        updateFields[config.secondaryAirtable.recordingField] = recordingUrl;
-      }
-      
-      await this.axios.patch(
-        `/${encodeURIComponent(config.secondaryAirtable.table)}`,
-        {
-          records: [{
-            id: recordId,
-            fields: updateFields
-          }]
-        }
-      );
-      
-      logger.info({
-        recordId,
-        dateConnected,
-        durationFormatted,
-        hasRecording: !!recordingUrl
-      }, 'Successfully updated call details (without count)');
+        processedAt: processedTimestamp
+      }, 'Successfully updated call details with processed timestamp');
       
       return true;
     } catch (error) {
@@ -720,7 +649,7 @@ class SecondaryAirtableClient {
         recordId,
         error: error.message,
         errorData: error.response?.data
-      }, 'Failed to update call details even without count');
+      }, 'Failed to update call details with timestamp in secondary base');
       return false;
     }
   }
@@ -1150,10 +1079,9 @@ async function sync() {
           const record = await secondaryAirtable.findRecordByPhone(phoneNumber);
           
           if (record) {
-            // Update the last call date, duration, recording share link, AND increment count
-            const updated = await secondaryAirtable.updateCallDetailsWithCount(
+            // Update the last call date, duration, recording share link, AND processed timestamp
+            const updated = await secondaryAirtable.updateCallDetailsWithTimestamp(
               record.id,
-              record, // Pass the whole record to access current count
               callData.dateConnected,
               durationFormatted,
               shareLink
@@ -1169,7 +1097,7 @@ async function sync() {
                 hasRecording: !!shareLink,
                 direction: 'outbound',
                 success: true
-              }, 'Updated secondary base record with all call details and incremented count');
+              }, 'Updated secondary base record with all call details and processed timestamp');
             }
           } else {
             logger.warn({
@@ -1185,7 +1113,7 @@ async function sync() {
         }
       }
       
-      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls with all details and counts)`);
+      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls with all details and timestamps)`);
     } else if (!secondaryAirtable) {
       logger.info('Secondary Airtable not configured');
     } else if (latestOutboundCalls.size === 0) {
