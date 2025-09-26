@@ -22,6 +22,13 @@ const config = {
     customersTable: process.env.AIRTABLE_CUSTOMERS_TABLE || 'Customers',
     callsTable: process.env.AIRTABLE_CALLS_TABLE || 'Calls'
   },
+  secondaryAirtable: {
+    enabled: !!(process.env.SECONDARY_AIRTABLE_BASE_ID && process.env.SECONDARY_AIRTABLE_TABLE),
+    baseId: process.env.SECONDARY_AIRTABLE_BASE_ID,
+    table: process.env.SECONDARY_AIRTABLE_TABLE,
+    phoneField: process.env.SECONDARY_PHONE_FIELD || 'Phone Format',
+    lastCallField: process.env.SECONDARY_LAST_CALL_FIELD || 'Dialpad Last Connected Call Date'
+  },
   fields: {
     customerPhone: process.env.CUSTOMER_PHONE_FIELD || 'Phone',
     callsCustomerLink: process.env.CALLS_CUSTOMER_LINK_FIELD || 'Customer',
@@ -104,10 +111,22 @@ function validateConfig() {
     logger.info(`Time range configured: ${config.timeRange.start} - ${config.timeRange.end} ${config.timeRange.timezone}`);
   }
   
+  // Log secondary Airtable config if enabled
+  if (config.secondaryAirtable.enabled) {
+    logger.info('Secondary Airtable base configured for client database updates');
+    logger.debug({
+      baseId: config.secondaryAirtable.baseId,
+      table: config.secondaryAirtable.table,
+      phoneField: config.secondaryAirtable.phoneField,
+      lastCallField: config.secondaryAirtable.lastCallField
+    }, 'Secondary Airtable config');
+  }
+  
   logger.info('Configuration validated successfully');
   logger.debug({
     dialpadConfigured: !!config.dialpad.apiKey,
     airtableConfigured: !!config.airtable.pat,
+    secondaryAirtableEnabled: config.secondaryAirtable.enabled,
     daysBack: config.sync.daysBack,
     pageSize: config.sync.pageSize,
     displayTimezone: config.sync.displayTimezone,
@@ -382,6 +401,73 @@ class AirtableClient {
   }
 }
 
+// Secondary Airtable client for updating client database
+class SecondaryAirtableClient {
+  constructor() {
+    this.axios = axios.create({
+      baseURL: `https://api.airtable.com/v0/${config.secondaryAirtable.baseId}`,
+      headers: {
+        'Authorization': `Bearer ${config.airtable.pat}`, // Use same PAT
+        'Content-Type': 'application/json'
+      },
+      timeout: 30000
+    });
+  }
+
+  async findRecordByPhone(phoneNumber) {
+    try {
+      // Search for record with matching phone number
+      const filterFormula = `{${config.secondaryAirtable.phoneField}} = "${phoneNumber}"`;
+      
+      const response = await this.axios.get(
+        `/${encodeURIComponent(config.secondaryAirtable.table)}`,
+        {
+          params: {
+            filterByFormula: filterFormula,
+            maxRecords: 1
+          }
+        }
+      );
+
+      if (response.data.records && response.data.records.length > 0) {
+        return response.data.records[0];
+      }
+      
+      return null;
+    } catch (error) {
+      logger.error({
+        phoneNumber,
+        error: error.message
+      }, 'Failed to find record in secondary base');
+      return null;
+    }
+  }
+
+  async updateLastCallDate(recordId, dateConnected) {
+    try {
+      await this.axios.patch(
+        `/${encodeURIComponent(config.secondaryAirtable.table)}`,
+        {
+          records: [{
+            id: recordId,
+            fields: {
+              [config.secondaryAirtable.lastCallField]: dateConnected
+            }
+          }]
+        }
+      );
+      
+      return true;
+    } catch (error) {
+      logger.error({
+        recordId,
+        error: error.message
+      }, 'Failed to update last call date in secondary base');
+      return false;
+    }
+  }
+}
+
 // Phone number normalization
 function normalizePhone(number, defaultRegion = config.sync.defaultRegion) {
   try {
@@ -408,6 +494,7 @@ async function sync() {
 
     const dialpad = new DialpadClient();
     const airtable = new AirtableClient();
+    const secondaryAirtable = config.secondaryAirtable.enabled ? new SecondaryAirtableClient() : null;
 
     // Test connections first
     logger.info('Testing API connections...');
@@ -570,8 +657,12 @@ async function sync() {
     let matchedCalls = 0;
     let connectedCalls = 0;
     let missedCalls = 0;
+    let secondaryUpdates = 0;
     let pageCount = 0;
     const maxPages = 200; // Safety limit
+
+    // Track latest connected inbound call per phone number for secondary base updates
+    const latestInboundCalls = new Map(); // phoneNumber -> dateConnected
 
     do {
       pageCount++;
@@ -619,6 +710,17 @@ async function sync() {
           connectedCalls++;
         } else {
           missedCalls++;
+        }
+        
+        // Track latest connected inbound call for secondary base update
+        if (direction === 'inbound' && wasConnected && externalNumber) {
+          const dateConnectedISO = new Date(connectedTime).toISOString();
+          const existing = latestInboundCalls.get(externalNumber);
+          
+          // Keep only the latest connected call per phone number
+          if (!existing || connectedTime > new Date(existing).getTime()) {
+            latestInboundCalls.set(externalNumber, dateConnectedISO);
+          }
         }
         
         // Normalize phone number
@@ -699,6 +801,43 @@ async function sync() {
       
     } while (cursor);
 
+    // Update secondary Airtable base with latest connected inbound calls
+    if (secondaryAirtable && latestInboundCalls.size > 0) {
+      logger.info(`Updating secondary base with ${latestInboundCalls.size} latest connected inbound calls...`);
+      
+      for (const [phoneNumber, dateConnected] of latestInboundCalls) {
+        try {
+          // Find record in secondary base by phone number
+          const record = await secondaryAirtable.findRecordByPhone(phoneNumber);
+          
+          if (record) {
+            // Update the last call date
+            const updated = await secondaryAirtable.updateLastCallDate(record.id, dateConnected);
+            
+            if (updated) {
+              secondaryUpdates++;
+              logger.debug({
+                phoneNumber,
+                recordId: record.id,
+                dateConnected
+              }, 'Updated secondary base record');
+            }
+          } else {
+            logger.debug({
+              phoneNumber
+            }, 'No matching record found in secondary base');
+          }
+        } catch (error) {
+          logger.error({
+            phoneNumber,
+            error: error.message
+          }, 'Failed to update secondary base for phone number');
+        }
+      }
+      
+      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestInboundCalls.size} records updated`);
+    }
+
     // Final summary
     logger.info({
       totalCalls,
@@ -708,6 +847,7 @@ async function sync() {
       unmatchedCalls: totalCalls - matchedCalls,
       matchRate: totalCalls > 0 ? `${(matchedCalls / totalCalls * 100).toFixed(2)}%` : 'N/A',
       connectionRate: totalCalls > 0 ? `${(connectedCalls / totalCalls * 100).toFixed(2)}%` : 'N/A',
+      secondaryBaseUpdates: secondaryUpdates,
       pagesProcessed: pageCount
     }, 'Sync completed');
 
@@ -718,6 +858,7 @@ async function sync() {
       missedCalls,
       matchedCalls,
       unmatchedCalls: totalCalls - matchedCalls,
+      secondaryBaseUpdates: secondaryUpdates,
       pagesProcessed: pageCount
     };
 
