@@ -632,7 +632,7 @@ async function sync() {
         // Normalize phone number
         const normalizedPhone = normalizePhone(externalNumber);
 
-        // Build call record for Airtable - only use fields that exist in your table
+        // Build call record for Airtable - only use fields that exist and are writable
         const callRecord = {
           'Call ID': callId,
           'Direction': direction === 'inbound' ? 'Inbound' : 'Outbound',
@@ -645,9 +645,8 @@ async function sync() {
           'MOS Score': call.mos_score || null
         };
         
-        // Add Call Date field (just the date portion)
-        const callDate = new Date(startTime);
-        callRecord['Call Date'] = `${callDate.getFullYear()}-${(callDate.getMonth() + 1).toString().padStart(2, '0')}-${callDate.getDate().toString().padStart(2, '0')}`;
+        // Note: Call Date is a computed field in Airtable, so we don't set it
+        // It will be automatically calculated from Start Time
 
         // Add recording URL if available
         if (call.recording_url && call.recording_url.length > 0) {
