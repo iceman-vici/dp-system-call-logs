@@ -33,7 +33,8 @@ const config = {
     defaultRegion: process.env.DEFAULT_REGION || 'SG',
     pageSize: Math.min(parseInt(process.env.PAGE_SIZE || '50'), 50), // Enforce max 50
     displayTimezone: process.env.DISPLAY_TIMEZONE || 'America/New_York',
-    realtimeOnly: process.env.REALTIME_ONLY === 'true' // New flag for real-time only mode
+    realtimeOnly: process.env.REALTIME_ONLY === 'true', // New flag for real-time only mode
+    specificDate: process.env.SPECIFIC_DATE // Format: YYYY-MM-DD
   },
   timeRange: {
     start: process.env.TIME_RANGE_START, // Format: HH:MM (e.g., "16:00" for 4 PM)
@@ -80,6 +81,15 @@ function validateConfig() {
     config.sync.pageSize = 50;
   }
   
+  // Validate specific date if provided
+  if (config.sync.specificDate) {
+    const datePattern = /^\d{4}-\d{2}-\d{2}$/;
+    if (!datePattern.test(config.sync.specificDate)) {
+      throw new Error('SPECIFIC_DATE must be in YYYY-MM-DD format');
+    }
+    logger.info(`Using specific date: ${config.sync.specificDate}`);
+  }
+  
   // Validate time range if configured
   if (hasTimeRangeConfig()) {
     const start = parseTime(config.timeRange.start);
@@ -121,20 +131,32 @@ function validateConfig() {
     pageSize: config.sync.pageSize,
     displayTimezone: config.sync.displayTimezone,
     realtimeOnly: config.sync.realtimeOnly,
+    specificDate: config.sync.specificDate,
     hasTimeRange: hasTimeRangeConfig(),
     timeRange: config.timeRange,
     businessHours: config.businessHours
   }, 'Config details');
 }
 
-// Get specific time range window for today in UTC milliseconds
-function getTimeRangeWindow() {
+// Get specific time range window for a given date in UTC milliseconds
+function getTimeRangeWindow(targetDate = null) {
   const start = parseTime(config.timeRange.start);
   const end = parseTime(config.timeRange.end);
   
-  const now = new Date();
+  let baseDate;
   
-  // Get today's date in the target timezone
+  // Use specific date if provided, otherwise use today
+  if (targetDate) {
+    baseDate = targetDate;
+  } else if (config.sync.specificDate) {
+    // Parse YYYY-MM-DD format
+    const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
+    baseDate = new Date(year, month - 1, day); // month is 0-indexed in JS
+  } else {
+    baseDate = new Date();
+  }
+  
+  // Get the date in the target timezone
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: config.timeRange.timezone,
     year: 'numeric',
@@ -142,7 +164,7 @@ function getTimeRangeWindow() {
     day: '2-digit'
   });
   
-  const dateParts = formatter.format(now);
+  const dateParts = formatter.format(baseDate);
   const [month, day, year] = dateParts.split('/');
   
   // Create date strings for start and end times
@@ -151,7 +173,7 @@ function getTimeRangeWindow() {
   
   // Parse these as local times in the specified timezone
   // We need to create dates that when converted to UTC give us the right times
-  const tzOffset = getTzOffsetMinutes(now, config.timeRange.timezone);
+  const tzOffset = getTzOffsetMinutes(baseDate, config.timeRange.timezone);
   
   // Create dates in local time
   const startLocal = new Date(startDateStr);
@@ -166,6 +188,7 @@ function getTimeRangeWindow() {
   const finalEnd = Math.min(endTimestamp, Date.now());
   
   logger.debug({
+    baseDate: baseDate.toISOString(),
     localStart: startDateStr,
     localEnd: endDateStr,
     tzOffsetMinutes: tzOffset,
@@ -180,7 +203,8 @@ function getTimeRangeWindow() {
   return {
     start: startTimestamp,
     end: finalEnd,
-    configured: `${config.timeRange.start} - ${config.timeRange.end} ${config.timeRange.timezone}`
+    configured: `${config.timeRange.start} - ${config.timeRange.end} ${config.timeRange.timezone}`,
+    date: baseDate.toLocaleDateString('en-US')
   };
 }
 
@@ -472,7 +496,7 @@ async function sync() {
     // Determine sync window
     const now = Date.now();
     const lastSyncedMs = (await state.getLastSynced()) * 1000; // Convert to ms
-    const backfillGraceMs = config.sync.backfill_graceSeconds * 1000;
+    const backfillGraceMs = config.sync.backfillGraceSeconds * 1000;
     
     let startedAfter;
     let startedBefore = now;
@@ -485,10 +509,42 @@ async function sync() {
       
       logger.info({
         timeRange: timeWindow.configured,
+        date: timeWindow.date,
         windowStart: new Date(timeWindow.start).toISOString(),
         windowEnd: new Date(timeWindow.end).toISOString(),
         note: 'Using specific time range configuration'
       }, 'Time range window set');
+      
+    } else if (config.sync.specificDate) {
+      // Use specific date without time range - fetch whole day
+      const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
+      const specificDate = new Date(year, month - 1, day);
+      const nextDay = new Date(year, month - 1, day + 1);
+      
+      // Get timezone offset for the dates
+      const tzOffset = getTzOffsetMinutes(specificDate, config.sync.displayTimezone || 'America/New_York');
+      
+      startedAfter = specificDate.getTime() - (tzOffset * 60 * 1000);
+      startedBefore = Math.min(nextDay.getTime() - (tzOffset * 60 * 1000), now);
+      
+      logger.info({
+        specificDate: config.sync.specificDate,
+        windowStart: new Date(startedAfter).toISOString(),
+        windowEnd: new Date(startedBefore).toISOString(),
+        note: 'Using specific date configuration'
+      }, 'Date window set');
+      
+    } else if (config.sync.daysBack > 0) {
+      // Historical mode: sync from X days back
+      const daysBackMs = config.sync.daysBack * 24 * 60 * 60 * 1000;
+      startedAfter = now - daysBackMs;
+      startedBefore = now;
+      
+      logger.info({
+        daysBack: config.sync.daysBack,
+        windowStart: new Date(startedAfter).toISOString(),
+        windowEnd: new Date(startedBefore).toISOString()
+      }, `Historical mode: Syncing from ${config.sync.daysBack} days back`);
       
     } else if (config.sync.realtimeOnly || config.sync.daysBack === 0) {
       // Real-time mode
@@ -499,14 +555,6 @@ async function sync() {
         startedAfter = getStartOfToday();
         logger.info('Real-time mode: First sync - starting from today');
       }
-    } else {
-      // Historical mode: sync from X days back
-      const daysBackMs = config.sync.daysBack * 24 * 60 * 60 * 1000;
-      startedAfter = Math.max(
-        now - daysBackMs,
-        lastSyncedMs > 0 ? lastSyncedMs - backfillGraceMs : now - daysBackMs
-      );
-      logger.info(`Historical mode: Syncing from ${config.sync.daysBack} days back`);
     }
     
     // Final validation of time window
@@ -527,7 +575,9 @@ async function sync() {
     }
     
     logger.info({
-      mode: hasTimeRangeConfig() ? 'Specific Time Range' : (config.sync.realtimeOnly ? 'Real-time' : 'Historical'),
+      mode: hasTimeRangeConfig() ? 'Specific Time Range' : 
+            (config.sync.specificDate ? 'Specific Date' : 
+            (config.sync.daysBack > 0 ? 'Historical' : 'Real-time')),
       lastSynced: lastSyncedMs > 0 ? new Date(lastSyncedMs).toISOString() : 'Never',
       startedAfter: new Date(startedAfter).toISOString(),
       startedBefore: new Date(startedBefore).toISOString(),
