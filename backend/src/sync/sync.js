@@ -25,7 +25,7 @@ const config = {
   fields: {
     customerPhone: process.env.CUSTOMER_PHONE_FIELD || 'Phone',
     callsCustomerLink: process.env.CALLS_CUSTOMER_LINK_FIELD || 'Customer',
-    callsUnmatchedPhone: process.env.CALLS_UNMATCHED_PHONE_FIELD
+    callsUnmatchedPhone: process.env.CALLS_UNMATCHED_PHONE_FIELD || 'Unmatched Phone'
   },
   sync: {
     daysBack: parseInt(process.env.DAYS_BACK || '0'), // Default to 0 for real-time
@@ -355,6 +355,22 @@ class AirtableClient {
       },
       timeout: 30000
     });
+    
+    // Add response interceptor for debugging
+    this.axios.interceptors.response.use(
+      response => response,
+      error => {
+        if (error.response) {
+          logger.error({
+            status: error.response.status,
+            data: error.response.data,
+            url: error.config?.url,
+            body: error.config?.data
+          }, 'Airtable API error response');
+        }
+        return Promise.reject(error);
+      }
+    );
   }
 
   async testConnection() {
@@ -616,31 +632,22 @@ async function sync() {
         // Normalize phone number
         const normalizedPhone = normalizePhone(externalNumber);
 
-        // Build call record for Airtable
+        // Build call record for Airtable - only use fields that exist in your table
         const callRecord = {
           'Call ID': callId,
-          'External Number': externalNumber || '',
           'Direction': direction === 'inbound' ? 'Inbound' : 'Outbound',
-          // Use ISO format - Airtable will handle timezone display based on field settings
           'Start Time': new Date(startTime).toISOString(),
           'End Time': endTime ? new Date(endTime).toISOString() : null,
-          // Optional: Add separate field for EDT display (you can add this field in Airtable)
-          'Start Time (EDT)': new Date(startTime).toLocaleString('en-US', { 
-            timeZone: config.timeRange.timezone || config.businessHours.timezone || 'America/New_York',
-            year: 'numeric',
-            month: '2-digit',
-            day: '2-digit',
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit',
-            hour12: true
-          }),
           'Duration (s)': duration,
           'Contact Name': call.contact?.name || 'Unknown',
           'Target': call.target?.name || 'N/A',
           'Was Recorded': call.was_recorded || false,
           'MOS Score': call.mos_score || null
         };
+        
+        // Add Call Date field (just the date portion)
+        const callDate = new Date(startTime);
+        callRecord['Call Date'] = `${callDate.getFullYear()}-${(callDate.getMonth() + 1).toString().padStart(2, '0')}-${callDate.getDate().toString().padStart(2, '0')}`;
 
         // Add recording URL if available
         if (call.recording_url && call.recording_url.length > 0) {
@@ -653,12 +660,18 @@ async function sync() {
         if (normalizedPhone && customerPhoneMap.has(normalizedPhone)) {
           callRecord[config.fields.callsCustomerLink] = [customerPhoneMap.get(normalizedPhone)];
           matchedCalls++;
-        } else if (config.fields.callsUnmatchedPhone) {
+        } else {
+          // Store unmatched phone number
           callRecord[config.fields.callsUnmatchedPhone] = externalNumber || 'Unknown';
         }
 
         callsToUpsert.push(callRecord);
         totalCalls++;
+        
+        // Log the first call to debug field mapping
+        if (totalCalls === 1) {
+          logger.debug({ callRecord }, 'First call record to be upserted');
+        }
       }
 
       // Upsert calls to Airtable
