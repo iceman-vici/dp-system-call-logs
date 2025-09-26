@@ -31,7 +31,9 @@ const config = {
     lastCallField: process.env.SECONDARY_LAST_CALL_FIELD || 'Dialpad Last Connected Call Date',
     durationField: process.env.SECONDARY_DURATION_FIELD || 'Dialpad Call Length',
     recordingField: process.env.SECONDARY_RECORDING_FIELD || 'DP Connected Last Call Audio',
-    processedField: process.env.SECONDARY_PROCESSED_FIELD || 'Dialpad_Last_Processed'
+    processedField: process.env.SECONDARY_PROCESSED_FIELD || 'Dialpad_Last_Processed',
+    batchSize: parseInt(process.env.SECONDARY_BATCH_SIZE || '10'), // New: configurable batch size
+    rateLimitMs: parseInt(process.env.SECONDARY_RATE_LIMIT_MS || '250') // New: configurable rate limit
   },
   fields: {
     customerPhone: process.env.CUSTOMER_PHONE_FIELD || 'Phone',
@@ -129,6 +131,8 @@ function validateConfig() {
       durationField: config.secondaryAirtable.durationField,
       recordingField: config.secondaryAirtable.recordingField,
       processedField: config.secondaryAirtable.processedField,
+      batchSize: config.secondaryAirtable.batchSize,
+      rateLimitMs: config.secondaryAirtable.rateLimitMs,
       usingSharedPAT: config.secondaryAirtable.pat === config.airtable.pat
     }, 'Secondary Airtable config');
   }
@@ -584,6 +588,21 @@ class SecondaryAirtableClient {
     }
   }
 
+  // NEW: Batch method to find multiple records by phone numbers
+  async findRecordsByPhones(phoneNumbers) {
+    const recordMap = new Map();
+    
+    // Process in smaller chunks to avoid complex filter formulas
+    for (const phone of phoneNumbers) {
+      const record = await this.findRecordByPhone(phone);
+      if (record) {
+        recordMap.set(phone, record);
+      }
+    }
+    
+    return recordMap;
+  }
+
   async updateCallDetailsWithTimestamp(recordId, dateConnected, durationFormatted, recordingUrl) {
     try {
       // Get current timestamp for when this record was processed
@@ -652,6 +671,135 @@ class SecondaryAirtableClient {
       }, 'Failed to update call details with timestamp in secondary base');
       return false;
     }
+  }
+
+  // NEW: Batch update method for processing multiple call updates efficiently
+  async updateCallDetailsBatch(updates, dialpad) {
+    const chunks = [];
+    const updateArray = Array.from(updates.entries());
+    const batchSize = config.secondaryAirtable.batchSize;
+    
+    // Split updates into chunks
+    for (let i = 0; i < updateArray.length; i += batchSize) {
+      chunks.push(updateArray.slice(i, i + batchSize));
+    }
+    
+    let successCount = 0;
+    let failedCount = 0;
+    
+    logger.info({
+      totalUpdates: updateArray.length,
+      chunks: chunks.length,
+      batchSize: batchSize
+    }, 'Starting batch update of secondary base records');
+    
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+      const chunk = chunks[chunkIndex];
+      logger.info(`Processing chunk ${chunkIndex + 1}/${chunks.length} with ${chunk.length} records`);
+      
+      try {
+        // First, find all records for this chunk
+        const phoneNumbers = chunk.map(([phone, data]) => phone);
+        const records = await this.findRecordsByPhones(phoneNumbers);
+        
+        // Prepare batch update
+        const batchUpdates = [];
+        const processedTimestamp = new Date().toISOString();
+        
+        for (const [phone, callData] of chunk) {
+          const record = records.get(phone);
+          if (record) {
+            // Create share link if needed
+            let shareLink = null;
+            if (callData.recordingId && dialpad) {
+              try {
+                shareLink = await dialpad.createRecordingShareLink(callData.recordingId);
+                logger.debug({
+                  phoneNumber: phone,
+                  recordingId: callData.recordingId,
+                  hasShareLink: !!shareLink
+                }, 'Created recording share link');
+              } catch (error) {
+                logger.warn({
+                  phoneNumber: phone,
+                  recordingId: callData.recordingId,
+                  error: error.message
+                }, 'Failed to create recording share link');
+              }
+            }
+            
+            const updateFields = {
+              [config.secondaryAirtable.lastCallField]: callData.dateConnected,
+              [config.secondaryAirtable.durationField]: formatDurationToMMSS(callData.duration)
+            };
+            
+            // Add processed timestamp field if configured
+            if (config.secondaryAirtable.processedField && config.secondaryAirtable.processedField.trim() !== '') {
+              updateFields[config.secondaryAirtable.processedField] = processedTimestamp;
+            }
+            
+            // Only add recording URL if it exists
+            if (shareLink) {
+              updateFields[config.secondaryAirtable.recordingField] = shareLink;
+            }
+            
+            batchUpdates.push({
+              id: record.id,
+              fields: updateFields
+            });
+          } else {
+            logger.warn({
+              phoneNumber: phone
+            }, 'No matching record found in secondary base');
+            failedCount++;
+          }
+        }
+        
+        // Send batch update if there are updates to send
+        if (batchUpdates.length > 0) {
+          logger.debug({
+            chunkIndex: chunkIndex + 1,
+            recordsToUpdate: batchUpdates.length,
+            sampleRecord: batchUpdates[0]
+          }, 'Sending batch update to secondary base');
+          
+          await this.axios.patch(
+            `/${encodeURIComponent(config.secondaryAirtable.table)}`,
+            { records: batchUpdates }
+          );
+          
+          successCount += batchUpdates.length;
+          
+          logger.info({
+            chunkIndex: chunkIndex + 1,
+            updated: batchUpdates.length,
+            totalSuccess: successCount
+          }, 'Batch update successful');
+        }
+        
+      } catch (error) {
+        logger.error({
+          chunkIndex: chunkIndex + 1,
+          error: error.message,
+          errorData: error.response?.data
+        }, 'Failed to process batch update chunk');
+        failedCount += chunk.length;
+      }
+      
+      // Rate limiting between chunks - respect Airtable's 5 rps limit
+      if (chunkIndex < chunks.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, config.secondaryAirtable.rateLimitMs));
+      }
+    }
+    
+    logger.info({
+      totalProcessed: updateArray.length,
+      successCount,
+      failedCount,
+      successRate: updateArray.length > 0 ? `${(successCount / updateArray.length * 100).toFixed(2)}%` : 'N/A'
+    }, 'Batch update completed');
+    
+    return successCount;
   }
 }
 
@@ -1044,76 +1192,34 @@ async function sync() {
       
     } while (cursor);
 
-    // Update secondary Airtable base with latest connected OUTBOUND calls and all details
+    // FIXED: Update secondary Airtable base using batch processing
     if (secondaryAirtable && latestOutboundCalls.size > 0) {
       logger.info({
         count: latestOutboundCalls.size,
-        phoneNumbers: Array.from(latestOutboundCalls.keys()),
-        direction: 'OUTBOUND'
-      }, 'Updating secondary base with latest connected outbound calls and all details');
+        phoneNumbers: Array.from(latestOutboundCalls.keys()).slice(0, 10), // Log first 10 for brevity
+        direction: 'OUTBOUND',
+        batchSize: config.secondaryAirtable.batchSize
+      }, 'Updating secondary base with batch processing for outbound calls');
       
-      for (const [phoneNumber, callData] of latestOutboundCalls) {
-        try {
-          const durationFormatted = formatDurationToMMSS(callData.duration);
-          let shareLink = null;
-          
-          // Create share link if recording ID exists
-          if (callData.recordingId) {
-            shareLink = await dialpad.createRecordingShareLink(callData.recordingId);
-            logger.info({
-              phoneNumber,
-              recordingId: callData.recordingId,
-              hasShareLink: !!shareLink
-            }, 'Created recording share link');
-          }
-          
-          logger.info({
-            phoneNumber,
-            dateConnected: callData.dateConnected,
-            duration: callData.duration,
-            durationFormatted,
-            hasRecording: !!shareLink
-          }, 'Processing update for phone (outbound call with all details)');
-          
-          // Find record in secondary base by phone number
-          const record = await secondaryAirtable.findRecordByPhone(phoneNumber);
-          
-          if (record) {
-            // Update the last call date, duration, recording share link, AND processed timestamp
-            const updated = await secondaryAirtable.updateCallDetailsWithTimestamp(
-              record.id,
-              callData.dateConnected,
-              durationFormatted,
-              shareLink
-            );
-            
-            if (updated) {
-              secondaryUpdates++;
-              logger.info({
-                phoneNumber,
-                recordId: record.id,
-                dateConnected: callData.dateConnected,
-                durationFormatted,
-                hasRecording: !!shareLink,
-                direction: 'outbound',
-                success: true
-              }, 'Updated secondary base record with all call details and processed timestamp');
-            }
-          } else {
-            logger.warn({
-              phoneNumber,
-              direction: 'outbound'
-            }, 'No matching record found in secondary base');
-          }
-        } catch (error) {
-          logger.error({
-            phoneNumber,
-            error: error.message
-          }, 'Failed to update secondary base for phone number');
-        }
+      try {
+        // Use the new batch update method
+        secondaryUpdates = await secondaryAirtable.updateCallDetailsBatch(latestOutboundCalls, dialpad);
+        
+        logger.info({
+          totalToUpdate: latestOutboundCalls.size,
+          successfullyUpdated: secondaryUpdates,
+          failedUpdates: latestOutboundCalls.size - secondaryUpdates,
+          successRate: latestOutboundCalls.size > 0 ? 
+            `${(secondaryUpdates / latestOutboundCalls.size * 100).toFixed(2)}%` : 'N/A'
+        }, 'Secondary base batch update completed');
+        
+      } catch (error) {
+        logger.error({
+          error: error.message,
+          totalRecords: latestOutboundCalls.size
+        }, 'Failed to complete secondary base batch updates');
       }
       
-      logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestOutboundCalls.size} records updated (outbound calls with all details and timestamps)`);
     } else if (!secondaryAirtable) {
       logger.info('Secondary Airtable not configured');
     } else if (latestOutboundCalls.size === 0) {
