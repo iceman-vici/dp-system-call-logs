@@ -446,10 +446,11 @@ class SecondaryAirtableClient {
       // Try to find with exact match first
       let filterFormula = `{${config.secondaryAirtable.phoneField}} = "${cleanPhone}"`;
       
-      logger.debug({
+      logger.info({
         originalPhone: phoneNumber,
         cleanPhone: cleanPhone,
-        filterFormula
+        filterFormula,
+        phoneField: config.secondaryAirtable.phoneField
       }, 'Searching for phone in secondary base');
       
       let response = await this.axios.get(
@@ -463,12 +464,18 @@ class SecondaryAirtableClient {
       );
 
       if (response.data.records && response.data.records.length > 0) {
+        logger.info({
+          phoneNumber,
+          recordFound: response.data.records[0].id,
+          matchType: 'exact without +'
+        }, 'Found record in secondary base');
         return response.data.records[0];
       }
       
       // If not found, also try with the original format (with +)
       if (phoneNumber.startsWith('+')) {
         filterFormula = `{${config.secondaryAirtable.phoneField}} = "${phoneNumber}"`;
+        logger.debug('Trying with original format (with +)');
         
         response = await this.axios.get(
           `/${encodeURIComponent(config.secondaryAirtable.table)}`,
@@ -481,6 +488,11 @@ class SecondaryAirtableClient {
         );
         
         if (response.data.records && response.data.records.length > 0) {
+          logger.info({
+            phoneNumber,
+            recordFound: response.data.records[0].id,
+            matchType: 'with +'
+          }, 'Found record in secondary base');
           return response.data.records[0];
         }
       }
@@ -489,6 +501,7 @@ class SecondaryAirtableClient {
       if (cleanPhone.length > 10) {
         const last10Digits = cleanPhone.slice(-10);
         filterFormula = `{${config.secondaryAirtable.phoneField}} = "${last10Digits}"`;
+        logger.debug(`Trying with last 10 digits: ${last10Digits}`);
         
         response = await this.axios.get(
           `/${encodeURIComponent(config.secondaryAirtable.table)}`,
@@ -501,19 +514,28 @@ class SecondaryAirtableClient {
         );
         
         if (response.data.records && response.data.records.length > 0) {
-          logger.debug({
+          logger.info({
             phoneNumber,
-            matchedWith: last10Digits
-          }, 'Found record with 10-digit match');
+            recordFound: response.data.records[0].id,
+            matchedWith: last10Digits,
+            matchType: '10-digit'
+          }, 'Found record in secondary base with 10-digit match');
           return response.data.records[0];
         }
       }
+      
+      logger.warn({
+        phoneNumber,
+        cleanPhone,
+        triedFormats: ['without +', 'with +', 'last 10 digits']
+      }, 'No matching record found in secondary base');
       
       return null;
     } catch (error) {
       logger.error({
         phoneNumber,
-        error: error.message
+        error: error.message,
+        errorData: error.response?.data
       }, 'Failed to find record in secondary base');
       return null;
     }
@@ -521,6 +543,12 @@ class SecondaryAirtableClient {
 
   async updateLastCallDate(recordId, dateConnected) {
     try {
+      logger.info({
+        recordId,
+        dateConnected,
+        field: config.secondaryAirtable.lastCallField
+      }, 'Updating last call date in secondary base');
+      
       await this.axios.patch(
         `/${encodeURIComponent(config.secondaryAirtable.table)}`,
         {
@@ -533,11 +561,17 @@ class SecondaryAirtableClient {
         }
       );
       
+      logger.info({
+        recordId,
+        dateConnected
+      }, 'Successfully updated last call date');
+      
       return true;
     } catch (error) {
       logger.error({
         recordId,
-        error: error.message
+        error: error.message,
+        errorData: error.response?.data
       }, 'Failed to update last call date in secondary base');
       return false;
     }
@@ -801,6 +835,13 @@ async function sync() {
           // Keep only the latest connected call per phone number
           if (!existing || connectedTime > new Date(existing).getTime()) {
             latestInboundCalls.set(externalNumber, dateConnectedISO);
+            logger.info({
+              direction,
+              wasConnected,
+              externalNumber,
+              dateConnected: dateConnectedISO,
+              action: 'Tracking for secondary base update'
+            }, 'Connected inbound call tracked');
           }
         }
         
@@ -884,10 +925,15 @@ async function sync() {
 
     // Update secondary Airtable base with latest connected inbound calls
     if (secondaryAirtable && latestInboundCalls.size > 0) {
-      logger.info(`Updating secondary base with ${latestInboundCalls.size} latest connected inbound calls...`);
+      logger.info({
+        count: latestInboundCalls.size,
+        phoneNumbers: Array.from(latestInboundCalls.keys())
+      }, 'Updating secondary base with latest connected inbound calls');
       
       for (const [phoneNumber, dateConnected] of latestInboundCalls) {
         try {
+          logger.info(`Processing update for phone: ${phoneNumber}`);
+          
           // Find record in secondary base by phone number
           const record = await secondaryAirtable.findRecordByPhone(phoneNumber);
           
@@ -897,14 +943,15 @@ async function sync() {
             
             if (updated) {
               secondaryUpdates++;
-              logger.debug({
+              logger.info({
                 phoneNumber,
                 recordId: record.id,
-                dateConnected
+                dateConnected,
+                success: true
               }, 'Updated secondary base record');
             }
           } else {
-            logger.debug({
+            logger.warn({
               phoneNumber
             }, 'No matching record found in secondary base');
           }
@@ -917,6 +964,10 @@ async function sync() {
       }
       
       logger.info(`Secondary base updates completed: ${secondaryUpdates}/${latestInboundCalls.size} records updated`);
+    } else if (!secondaryAirtable) {
+      logger.info('Secondary Airtable not configured');
+    } else if (latestInboundCalls.size === 0) {
+      logger.info('No connected inbound calls to update in secondary base');
     }
 
     // Final summary
