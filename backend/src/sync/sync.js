@@ -1,3 +1,5 @@
+require('dotenv').config(); // Load .env file
+
 const axios = require('axios');
 const { parsePhoneNumber } = require('libphonenumber-js');
 const pino = require('pino');
@@ -26,10 +28,10 @@ const config = {
     callsUnmatchedPhone: process.env.CALLS_UNMATCHED_PHONE_FIELD
   },
   sync: {
-    daysBack: parseInt(process.env.DAYS_BACK || '14'),
-    backfillGraceSeconds: parseInt(process.env.BACKFILL_GRACE_SECONDS || '21600'),
+    daysBack: parseInt(process.env.DAYS_BACK || '7'), // Reduced to 7 days
+    backfillGraceSeconds: parseInt(process.env.BACKFILL_GRACE_SECONDS || '3600'), // 1 hour
     defaultRegion: process.env.DEFAULT_REGION || 'SG',
-    pageSize: parseInt(process.env.PAGE_SIZE || '100')
+    pageSize: parseInt(process.env.PAGE_SIZE || '50') // Reduced page size
   }
 };
 
@@ -46,6 +48,14 @@ function validateConfig() {
   if (missing.length > 0) {
     throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
   }
+  
+  logger.info('Configuration validated successfully');
+  logger.debug({
+    dialpadConfigured: !!config.dialpad.apiKey,
+    airtableConfigured: !!config.airtable.pat,
+    daysBack: config.sync.daysBack,
+    pageSize: config.sync.pageSize
+  }, 'Config details');
 }
 
 // Dialpad API client - Updated to match actual API
@@ -59,26 +69,51 @@ class DialpadClient {
       },
       timeout: 30000
     });
+    
+    // Add response interceptor for debugging
+    this.axios.interceptors.response.use(
+      response => response,
+      error => {
+        if (error.response) {
+          logger.error({
+            status: error.response.status,
+            data: error.response.data,
+            headers: error.response.headers
+          }, 'Dialpad API error response');
+        }
+        return Promise.reject(error);
+      }
+    );
   }
 
-  async getCompanyNumbers() {
-    // This endpoint might be different, keeping for compatibility
+  async testConnection() {
     try {
-      const response = await retry(
-        () => this.axios.get('/api/v2/company/numbers'),
-        'Dialpad getCompanyNumbers'
-      );
-      return response.data.items || [];
+      // Try a simple API call to test the connection
+      const response = await this.axios.get('/api/v2/call', {
+        params: {
+          started_after: Date.now() - (24 * 60 * 60 * 1000), // Last 24 hours
+          started_before: Date.now(),
+          limit: 1
+        }
+      });
+      logger.info('Dialpad API connection successful');
+      return true;
     } catch (error) {
-      logger.warn('Could not fetch company numbers, will process all calls');
-      return [];
+      logger.error('Dialpad API connection failed:', error.message);
+      if (error.response?.status === 401) {
+        throw new Error('Invalid Dialpad API key. Please check your credentials.');
+      } else if (error.response?.status === 400) {
+        // Try alternate endpoint format
+        logger.info('Trying alternate API format...');
+      }
+      throw error;
     }
   }
 
   async getCalls(startedAfter, startedBefore, cursor = null) {
     const params = {
-      started_after: startedAfter, // Milliseconds timestamp
-      started_before: startedBefore, // Milliseconds timestamp
+      started_after: Math.floor(startedAfter), // Ensure it's an integer
+      started_before: Math.floor(startedBefore), // Ensure it's an integer
       limit: config.sync.pageSize
     };
     
@@ -86,17 +121,37 @@ class DialpadClient {
       params.cursor = cursor;
     }
 
-    logger.debug({ params }, 'Fetching calls with params');
+    logger.info({
+      startedAfter: new Date(startedAfter).toISOString(),
+      startedBefore: new Date(startedBefore).toISOString(),
+      limit: params.limit
+    }, 'Fetching calls from Dialpad');
 
-    const response = await retry(
-      () => this.axios.get('/api/v2/call', { params }),
-      'Dialpad getCalls'
-    );
-    
-    return {
-      items: response.data.items || [],
-      cursor: response.data.cursor || null
-    };
+    try {
+      const response = await this.axios.get('/api/v2/call', { params });
+      
+      const items = response.data.items || [];
+      logger.info(`Retrieved ${items.length} calls from Dialpad`);
+      
+      return {
+        items,
+        cursor: response.data.cursor || null
+      };
+    } catch (error) {
+      if (error.response?.status === 400) {
+        logger.error('Bad request to Dialpad API. This might be due to:');
+        logger.error('1. Date range is too large (try reducing DAYS_BACK)');
+        logger.error('2. Invalid timestamp format');
+        logger.error('3. API endpoint has changed');
+        
+        // Log the actual request for debugging
+        logger.error({
+          url: error.config?.url,
+          params: error.config?.params
+        }, 'Failed request details');
+      }
+      throw error;
+    }
   }
 }
 
@@ -111,6 +166,25 @@ class AirtableClient {
       },
       timeout: 30000
     });
+  }
+
+  async testConnection() {
+    try {
+      const response = await this.axios.get(
+        `/${encodeURIComponent(config.airtable.customersTable)}`,
+        { params: { maxRecords: 1 } }
+      );
+      logger.info('Airtable connection successful');
+      return true;
+    } catch (error) {
+      logger.error('Airtable connection failed:', error.message);
+      if (error.response?.status === 401) {
+        throw new Error('Invalid Airtable PAT. Please check your credentials.');
+      } else if (error.response?.status === 404) {
+        throw new Error('Airtable base or table not found. Check your base ID and table names.');
+      }
+      throw error;
+    }
   }
 
   async getCustomers() {
@@ -193,32 +267,11 @@ async function sync() {
     const dialpad = new DialpadClient();
     const airtable = new AirtableClient();
 
-    // Get company numbers if available
-    logger.info('Fetching company numbers...');
-    const companyNumbers = await dialpad.getCompanyNumbers();
-    const companyNumbersSet = new Set(
-      companyNumbers.map(n => normalizePhone(n.phone_number || n.number)).filter(Boolean)
-    );
-    logger.info(`Found ${companyNumbersSet.size} company numbers`);
-
-    // Determine sync window
-    const lastSyncedMs = (await state.getLastSynced()) * 1000; // Convert to ms
-    const now = Date.now();
-    const daysBackMs = config.sync.daysBack * 24 * 60 * 60 * 1000;
-    const backfillGraceMs = config.sync.backfillGraceSeconds * 1000;
-    
-    // Use milliseconds for Dialpad API
-    const startedAfter = Math.max(
-      now - daysBackMs,
-      lastSyncedMs - backfillGraceMs
-    );
-    const startedBefore = now;
-    
-    logger.info({
-      lastSynced: new Date(lastSyncedMs).toISOString(),
-      startedAfter: new Date(startedAfter).toISOString(),
-      startedBefore: new Date(startedBefore).toISOString()
-    }, 'Sync window determined');
+    // Test connections first
+    logger.info('Testing API connections...');
+    await dialpad.testConnection();
+    await airtable.testConnection();
+    logger.info('API connections verified');
 
     // Get customers from Airtable
     logger.info('Loading customers from Airtable...');
@@ -236,6 +289,26 @@ async function sync() {
     }
     logger.info(`Loaded ${customerPhoneMap.size} customers with phone numbers`);
 
+    // Determine sync window
+    const lastSyncedMs = (await state.getLastSynced()) * 1000; // Convert to ms
+    const now = Date.now();
+    const daysBackMs = config.sync.daysBack * 24 * 60 * 60 * 1000;
+    const backfillGraceMs = config.sync.backfillGraceSeconds * 1000;
+    
+    // Use milliseconds for Dialpad API
+    const startedAfter = Math.max(
+      now - daysBackMs,
+      lastSyncedMs > 0 ? lastSyncedMs - backfillGraceMs : now - daysBackMs
+    );
+    const startedBefore = now;
+    
+    logger.info({
+      lastSynced: lastSyncedMs > 0 ? new Date(lastSyncedMs).toISOString() : 'Never',
+      startedAfter: new Date(startedAfter).toISOString(),
+      startedBefore: new Date(startedBefore).toISOString(),
+      daysBack: config.sync.daysBack
+    }, 'Sync window determined');
+
     // Fetch and process calls
     let cursor = null;
     let totalCalls = 0;
@@ -247,11 +320,15 @@ async function sync() {
       pageCount++;
       logger.info(`Fetching calls page ${pageCount}...`);
       
-      const { items: calls, cursor: nextCursor } = await dialpad.getCalls(
-        startedAfter,
-        startedBefore,
-        cursor
-      );
+      let calls, nextCursor;
+      try {
+        const result = await dialpad.getCalls(startedAfter, startedBefore, cursor);
+        calls = result.items;
+        nextCursor = result.cursor;
+      } catch (error) {
+        logger.error(`Failed to fetch page ${pageCount}:`, error.message);
+        break;
+      }
       
       if (calls.length === 0) {
         logger.info('No more calls to process');
@@ -272,24 +349,11 @@ async function sync() {
         
         // Normalize phone number
         const normalizedPhone = normalizePhone(externalNumber);
-        
-        // Determine if this is a company number
-        let customerPhone = normalizedPhone;
-        let isInternalCall = false;
-        
-        if (companyNumbersSet.size > 0 && normalizedPhone) {
-          isInternalCall = companyNumbersSet.has(normalizedPhone);
-          if (isInternalCall) {
-            // Skip internal calls
-            logger.debug({ call: callId }, 'Skipping internal call');
-            continue;
-          }
-        }
 
         // Build call record for Airtable
         const callRecord = {
           'Call ID': callId,
-          'External Number': externalNumber,
+          'External Number': externalNumber || '',
           'Direction': direction === 'inbound' ? 'Inbound' : 'Outbound',
           'Start Time': new Date(startTime).toISOString(),
           'End Time': endTime ? new Date(endTime).toISOString() : null,
@@ -308,11 +372,11 @@ async function sync() {
         }
 
         // Match to customer
-        if (customerPhone && customerPhoneMap.has(customerPhone)) {
-          callRecord[config.fields.callsCustomerLink] = [customerPhoneMap.get(customerPhone)];
+        if (normalizedPhone && customerPhoneMap.has(normalizedPhone)) {
+          callRecord[config.fields.callsCustomerLink] = [customerPhoneMap.get(normalizedPhone)];
           matchedCalls++;
         } else if (config.fields.callsUnmatchedPhone) {
-          callRecord[config.fields.callsUnmatchedPhone] = customerPhone || externalNumber || 'Unknown';
+          callRecord[config.fields.callsUnmatchedPhone] = externalNumber || 'Unknown';
         }
 
         callsToUpsert.push(callRecord);
@@ -322,7 +386,11 @@ async function sync() {
       // Upsert calls to Airtable
       if (callsToUpsert.length > 0) {
         logger.info(`Upserting ${callsToUpsert.length} calls to Airtable...`);
-        await airtable.upsertCalls(callsToUpsert);
+        try {
+          await airtable.upsertCalls(callsToUpsert);
+        } catch (error) {
+          logger.error('Failed to upsert calls to Airtable:', error.message);
+        }
       }
 
       // Update state after each page
