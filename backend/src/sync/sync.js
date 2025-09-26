@@ -134,55 +134,33 @@ function getTimeRangeWindow() {
   
   const now = new Date();
   
-  // Create date strings in the target timezone
-  // We need to create dates that represent "today at X time in timezone Y"
-  const options = { timeZone: config.timeRange.timezone };
-  const tzNow = new Date(now.toLocaleString('en-US', options));
-  
-  // Create today's date at the specified times in the target timezone
-  const year = tzNow.getFullYear();
-  const month = tzNow.getMonth();
-  const day = tzNow.getDate();
-  
-  // Create local date objects for start and end times
-  const startLocal = new Date(year, month, day, start.hour, start.minute, 0, 0);
-  const endLocal = new Date(year, month, day, end.hour, end.minute, 0, 0);
-  
-  // Now we need to figure out what these times are in UTC
-  // We'll use a different approach: format the dates in the target timezone and parse them
+  // Get today's date in the target timezone
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: config.timeRange.timezone,
     year: 'numeric',
     month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
+    day: '2-digit'
   });
   
-  // Get current date in the timezone to ensure we're on the right day
-  const tzParts = formatter.formatToParts(now);
-  const tzYear = tzParts.find(p => p.type === 'year').value;
-  const tzMonth = tzParts.find(p => p.type === 'month').value;
-  const tzDay = tzParts.find(p => p.type === 'day').value;
+  const dateParts = formatter.format(now);
+  const [month, day, year] = dateParts.split('/');
   
-  // Build ISO strings for the start and end times in the target timezone
-  const startDateStr = `${tzYear}-${tzMonth}-${tzDay}T${start.hour.toString().padStart(2, '0')}:${start.minute.toString().padStart(2, '0')}:00`;
-  const endDateStr = `${tzYear}-${tzMonth}-${tzDay}T${end.hour.toString().padStart(2, '0')}:${end.minute.toString().padStart(2, '0')}:00`;
+  // Create date strings for start and end times
+  const startDateStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${start.hour.toString().padStart(2, '0')}:${start.minute.toString().padStart(2, '0')}:00`;
+  const endDateStr = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${end.hour.toString().padStart(2, '0')}:${end.minute.toString().padStart(2, '0')}:00`;
   
-  // These dates are in the local timezone, but represent the target timezone times
-  const startDate = new Date(startDateStr);
-  const endDate = new Date(endDateStr);
+  // Parse these as local times in the specified timezone
+  // We need to create dates that when converted to UTC give us the right times
+  const tzOffset = getTzOffsetMinutes(now, config.timeRange.timezone);
   
-  // Get the timezone offset for New York (EDT is UTC-4, EST is UTC-5)
-  const isDST = isDaylightSavingTime(now, config.timeRange.timezone);
-  const offsetHours = config.timeRange.timezone.includes('New_York') ? (isDST ? 4 : 5) : 0;
-  const offsetMs = offsetHours * 60 * 60 * 1000;
+  // Create dates in local time
+  const startLocal = new Date(startDateStr);
+  const endLocal = new Date(endDateStr);
   
-  // Add the offset to get UTC time
-  const startTimestamp = startDate.getTime() + offsetMs;
-  const endTimestamp = endDate.getTime() + offsetMs;
+  // Adjust for timezone offset to get UTC
+  // If timezone is EDT (UTC-4), we need to subtract the negative offset (add 4 hours)
+  const startTimestamp = startLocal.getTime() - (tzOffset * 60 * 1000);
+  const endTimestamp = endLocal.getTime() - (tzOffset * 60 * 1000);
   
   // Don't go into the future
   const finalEnd = Math.min(endTimestamp, Date.now());
@@ -190,12 +168,13 @@ function getTimeRangeWindow() {
   logger.debug({
     localStart: startDateStr,
     localEnd: endDateStr,
-    isDST,
-    offsetHours,
+    tzOffsetMinutes: tzOffset,
     startTimestamp,
     endTimestamp,
     startUTC: new Date(startTimestamp).toISOString(),
-    endUTC: new Date(finalEnd).toISOString()
+    endUTC: new Date(finalEnd).toISOString(),
+    startLocal: new Date(startTimestamp).toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
+    endLocal: new Date(finalEnd).toLocaleString('en-US', { timeZone: config.timeRange.timezone })
   }, 'Time range calculation details');
   
   return {
@@ -205,24 +184,19 @@ function getTimeRangeWindow() {
   };
 }
 
-// Check if currently in DST for a timezone
-function isDaylightSavingTime(date, timezone) {
-  // For US timezones, DST runs from second Sunday in March to first Sunday in November
-  const month = date.getMonth() + 1; // JavaScript months are 0-indexed
+// Get timezone offset in minutes (positive for west of UTC, negative for east)
+function getTzOffsetMinutes(date, timezone) {
+  // Create two dates: one in UTC and one in the target timezone
+  const utcDate = new Date(date.toLocaleString('en-US', { timeZone: 'UTC' }));
+  const tzDate = new Date(date.toLocaleString('en-US', { timeZone: timezone }));
   
-  // Definitely in DST (April-October)
-  if (month >= 4 && month <= 10) return true;
+  // Calculate difference in minutes
+  // If timezone is behind UTC (like EDT/EST), this will be positive
+  // If timezone is ahead of UTC (like Asia), this will be negative
+  const offsetMs = utcDate - tzDate;
+  const offsetMinutes = Math.round(offsetMs / 60000);
   
-  // Definitely not in DST (December-February)
-  if (month === 12 || month === 1 || month === 2) return false;
-  
-  // March and November need more careful checking
-  // For now, we'll use a simple approximation
-  // In 2024-2025, DST starts March 10 and ends November 3
-  if (month === 3) return date.getDate() >= 10;
-  if (month === 11) return date.getDate() < 3;
-  
-  return false;
+  return offsetMinutes;
 }
 
 // Get start of current day in milliseconds
@@ -498,7 +472,7 @@ async function sync() {
     // Determine sync window
     const now = Date.now();
     const lastSyncedMs = (await state.getLastSynced()) * 1000; // Convert to ms
-    const backfillGraceMs = config.sync.backfillGraceSeconds * 1000;
+    const backfillGraceMs = config.sync.backfill_graceSeconds * 1000;
     
     let startedAfter;
     let startedBefore = now;
