@@ -125,6 +125,23 @@ function getStartOfToday() {
   return startOfDay.getTime();
 }
 
+// Create date in timezone
+function createDateInTimezone(year, month, day, hour, minute, timezone) {
+  // Create a date string in ISO format
+  const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
+  
+  // Parse it as a date in the specified timezone
+  const date = new Date(dateStr);
+  
+  // For EDT (UTC-4), add 4 hours to get UTC time
+  // For EST (UTC-5), add 5 hours to get UTC time
+  const isDST = timezone.includes('New_York') && (month >= 3 && month <= 11);
+  const offsetHours = isDST ? 4 : 5;
+  
+  // Return the timestamp adjusted for timezone
+  return date.getTime() + (offsetHours * 60 * 60 * 1000);
+}
+
 // Dialpad API client
 class DialpadClient {
   constructor() {
@@ -402,61 +419,53 @@ async function sync() {
       const end = parseTime(config.timeRange.end);
       
       // Determine the base date
-      let baseDate;
+      let year, month, day;
+      
       if (config.sync.specificDate) {
         // Use specific date
-        const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
-        baseDate = new Date(year, month - 1, day);
+        [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
         logger.info(`Using specific date: ${config.sync.specificDate}`);
       } else {
-        // Use today
-        baseDate = new Date();
-        logger.info('Using today for time range');
+        // Use today's date IN THE TARGET TIMEZONE
+        // This is crucial - we need today's date in EDT, not UTC
+        const nowInTimezone = new Date().toLocaleString('en-US', { 
+          timeZone: config.timeRange.timezone,
+          year: 'numeric',
+          month: 'numeric',
+          day: 'numeric'
+        });
+        const [m, d, y] = nowInTimezone.split('/');
+        year = parseInt(y);
+        month = parseInt(m);
+        day = parseInt(d);
+        logger.info(`Using today in ${config.timeRange.timezone}: ${year}-${month}-${day}`);
       }
       
-      // Create start and end dates with the specified times
-      const startDate = new Date(
-        baseDate.getFullYear(),
-        baseDate.getMonth(),
-        baseDate.getDate(),
-        start.hour,
-        start.minute,
-        0,
-        0
-      );
+      // Create timestamps for the time range
+      startedAfter = createDateInTimezone(year, month, day, start.hour, start.minute, config.timeRange.timezone);
+      startedBefore = createDateInTimezone(year, month, day, end.hour, end.minute, config.timeRange.timezone);
       
-      const endDate = new Date(
-        baseDate.getFullYear(),
-        baseDate.getMonth(),
-        baseDate.getDate(),
-        end.hour,
-        end.minute,
-        0,
-        0
-      );
-      
-      // Convert to milliseconds
-      startedAfter = startDate.getTime();
-      startedBefore = Math.min(endDate.getTime(), now); // Don't go into future
+      // Don't go into future
+      startedBefore = Math.min(startedBefore, now);
       
       logger.info({
-        date: baseDate.toDateString(),
+        date: `${year}-${month}-${day}`,
         timeRange: `${config.timeRange.start} - ${config.timeRange.end}`,
         timezone: config.timeRange.timezone,
-        startLocal: startDate.toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
-        endLocal: endDate.toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
         startUTC: new Date(startedAfter).toISOString(),
-        endUTC: new Date(startedBefore).toISOString()
+        endUTC: new Date(startedBefore).toISOString(),
+        startLocal: new Date(startedAfter).toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
+        endLocal: new Date(startedBefore).toLocaleString('en-US', { timeZone: config.timeRange.timezone })
       }, 'Time range window configured');
       
     } else if (config.sync.specificDate) {
       // Specific date without time range - get whole day
       const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
-      const startDate = new Date(year, month - 1, day, 0, 0, 0, 0);
-      const endDate = new Date(year, month - 1, day + 1, 0, 0, 0, 0);
-      
-      startedAfter = startDate.getTime();
-      startedBefore = Math.min(endDate.getTime(), now);
+      startedAfter = createDateInTimezone(year, month, day, 0, 0, config.timeRange.timezone);
+      startedBefore = Math.min(
+        createDateInTimezone(year, month, day, 23, 59, config.timeRange.timezone),
+        now
+      );
       
       logger.info({
         specificDate: config.sync.specificDate,
