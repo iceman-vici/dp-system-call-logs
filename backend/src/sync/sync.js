@@ -37,8 +37,8 @@ const config = {
     specificDate: process.env.SPECIFIC_DATE && process.env.SPECIFIC_DATE.trim() ? process.env.SPECIFIC_DATE.trim() : null // Format: YYYY-MM-DD
   },
   timeRange: {
-    start: process.env.TIME_RANGE_START, // Format: HH:MM (e.g., "16:00" for 4 PM)
-    end: process.env.TIME_RANGE_END,     // Format: HH:MM (e.g., "18:00" for 6 PM)
+    start: process.env.TIME_RANGE_START, // Format: HH:MM (e.g., "04:00" for 4 AM)
+    end: process.env.TIME_RANGE_END,     // Format: HH:MM (e.g., "06:00" for 6 AM)
     timezone: process.env.TIME_RANGE_TIMEZONE || 'America/New_York'
   }
 };
@@ -125,60 +125,48 @@ function getStartOfToday() {
   return startOfDay.getTime();
 }
 
-// Get current date in a specific timezone
-function getTodayInTimezone(timezone) {
-  // Get current time
-  const now = new Date();
+// Get UTC timestamp for a specific date/time in EDT/EST
+function getEDTTimestamp(year, month, day, hour, minute) {
+  // Create the date/time string in EDT format
+  // Month needs to be padded and 1-indexed for Date parsing
+  const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')} ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
   
-  // Format it in the target timezone to get the actual date there
-  const formatter = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  });
+  // Parse this as EDT/EST time
+  // We'll manually calculate the UTC offset
+  // EDT = UTC-4 (March to November)
+  // EST = UTC-5 (November to March)
   
-  const formatted = formatter.format(now);
-  const [month, day, year] = formatted.split('/');
+  // For September, we're in EDT (UTC-4)
+  const edtOffset = 4; // hours behind UTC
   
-  return {
-    year: parseInt(year),
-    month: parseInt(month),
-    day: parseInt(day)
-  };
-}
-
-// Get UTC timestamp for a specific time in a timezone
-function getUTCTimestamp(year, month, day, hour, minute, timezone) {
-  // Create an ISO string for the date/time
-  const dateStr = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}T${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}:00`;
-  
-  // Create date object (will be in system timezone)
+  // Create a date object for this time
+  // JavaScript will parse this in local time, but we'll adjust it
   const localDate = new Date(dateStr);
   
-  // Get the timezone offset for EDT/EST
-  // EDT (summer) = UTC-4, EST (winter) = UTC-5
-  // September is EDT (Daylight Saving Time)
-  let offsetHours = 4; // EDT offset
-  if (timezone.includes('New_York')) {
-    // Check if we're in DST (roughly March-November)
-    if (month >= 11 || month <= 2) {
-      offsetHours = 5; // EST
-    } else {
-      offsetHours = 4; // EDT
-    }
-  }
+  // Get what JavaScript thinks is the UTC time
+  const year_utc = localDate.getFullYear();
+  const month_utc = localDate.getMonth();
+  const day_utc = localDate.getDate();
+  const hour_utc = localDate.getHours();
+  const minute_utc = localDate.getMinutes();
   
-  // The date we created is in system time, but we want it to represent EDT time
-  // So we need to adjust based on the system's offset vs EDT offset
-  const systemOffset = localDate.getTimezoneOffset(); // in minutes, positive for west of UTC
-  const edtOffsetMinutes = offsetHours * 60; // EDT is 240 minutes behind UTC
+  // Create a UTC date with these values
+  const utcDate = Date.UTC(year_utc, month_utc, day_utc, hour_utc, minute_utc, 0, 0);
   
-  // Adjust the timestamp
-  const adjustmentMinutes = systemOffset - edtOffsetMinutes;
-  const utcTimestamp = localDate.getTime() + (adjustmentMinutes * 60 * 1000);
+  // Now adjust for the fact that we want EDT, not local time
+  // Get the local timezone offset in minutes (positive = behind UTC)
+  const localOffset = new Date().getTimezoneOffset();
   
-  return utcTimestamp;
+  // EDT is 240 minutes behind UTC (4 hours * 60 minutes)
+  const edtOffsetMinutes = edtOffset * 60;
+  
+  // Calculate the adjustment needed
+  const adjustmentMinutes = localOffset - edtOffsetMinutes;
+  
+  // Apply the adjustment
+  const edtTimestamp = utcDate + (adjustmentMinutes * 60 * 1000);
+  
+  return edtTimestamp;
 }
 
 // Dialpad API client
@@ -257,6 +245,10 @@ class DialpadClient {
     logger.info({
       startedAfter: new Date(startedAfter).toISOString(),
       startedBefore: new Date(startedBefore).toISOString(),
+      startedAfterEDT: new Date(startedAfter).toLocaleString('en-US', { timeZone: 'America/New_York' }),
+      startedBeforeEDT: new Date(startedBefore).toLocaleString('en-US', { timeZone: 'America/New_York' }),
+      startedAfterEpoch: startedAfter,
+      startedBeforeEpoch: startedBefore,
       limit: params.limit,
       cursor: cursor ? 'present' : 'none'
     }, 'Fetching calls from Dialpad');
@@ -271,6 +263,16 @@ class DialpadClient {
         retrieved: items.length,
         hasMore: !!nextCursor
       }, 'Retrieved calls from Dialpad');
+      
+      // Log first call's time if available for debugging
+      if (items.length > 0) {
+        const firstCall = items[0];
+        logger.debug({
+          firstCallStart: new Date(parseInt(firstCall.date_started)).toISOString(),
+          firstCallStartEDT: new Date(parseInt(firstCall.date_started)).toLocaleString('en-US', { timeZone: 'America/New_York' }),
+          firstCallEpoch: firstCall.date_started
+        }, 'First call in results');
+      }
       
       return {
         items,
@@ -465,39 +467,57 @@ async function sync() {
         [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
         logger.info(`Using specific date: ${config.sync.specificDate}`);
       } else {
-        // Use today's date IN THE TARGET TIMEZONE (not system timezone)
-        const todayInTimezone = getTodayInTimezone(config.timeRange.timezone);
-        year = todayInTimezone.year;
-        month = todayInTimezone.month;
-        day = todayInTimezone.day;
-        logger.info(`Using today in ${config.timeRange.timezone}: ${year}-${month}-${day}`);
+        // Get current date/time in EDT
+        const nowStr = new Date().toLocaleString('en-US', { 
+          timeZone: 'America/New_York',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour12: false
+        });
+        
+        // Parse the date parts
+        const [datePartEDT, timePartEDT] = nowStr.split(', ');
+        const [monthEDT, dayEDT, yearEDT] = datePartEDT.split('/');
+        
+        year = parseInt(yearEDT);
+        month = parseInt(monthEDT);
+        day = parseInt(dayEDT);
+        
+        logger.info(`Current EDT date/time: ${nowStr}`);
+        logger.info(`Using today in EDT: ${year}-${month}-${day}`);
       }
       
       // Get UTC timestamps for the time range
-      startedAfter = getUTCTimestamp(year, month, day, start.hour, start.minute, config.timeRange.timezone);
-      startedBefore = getUTCTimestamp(year, month, day, end.hour, end.minute, config.timeRange.timezone);
+      // These represent 4 AM and 6 AM EDT converted to UTC milliseconds
+      startedAfter = getEDTTimestamp(year, month, day, start.hour, start.minute);
+      startedBefore = getEDTTimestamp(year, month, day, end.hour, end.minute);
       
       // Don't go into future
       startedBefore = Math.min(startedBefore, now);
       
+      // Debug logging
       logger.info({
         date: `${year}-${month}-${day}`,
         timeRange: `${config.timeRange.start} - ${config.timeRange.end}`,
-        timezone: config.timeRange.timezone,
+        timezone: 'America/New_York (EDT)',
         startUTC: new Date(startedAfter).toISOString(),
         endUTC: new Date(startedBefore).toISOString(),
-        startInTimezone: new Date(startedAfter).toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
-        endInTimezone: new Date(startedBefore).toLocaleString('en-US', { timeZone: config.timeRange.timezone }),
+        startEDT: new Date(startedAfter).toLocaleString('en-US', { timeZone: 'America/New_York' }),
+        endEDT: new Date(startedBefore).toLocaleString('en-US', { timeZone: 'America/New_York' }),
+        startEpoch: startedAfter,
+        endEpoch: startedBefore,
         systemTimezoneOffset: new Date().getTimezoneOffset(),
-        note: 'Times shown in target timezone'
+        currentTimeUTC: new Date().toISOString(),
+        currentTimeEDT: new Date().toLocaleString('en-US', { timeZone: 'America/New_York' })
       }, 'Time range window configured');
       
     } else if (config.sync.specificDate) {
       // Specific date without time range - get whole day
       const [year, month, day] = config.sync.specificDate.split('-').map(n => parseInt(n));
-      startedAfter = getUTCTimestamp(year, month, day, 0, 0, config.timeRange.timezone);
+      startedAfter = getEDTTimestamp(year, month, day, 0, 0);
       startedBefore = Math.min(
-        getUTCTimestamp(year, month, day, 23, 59, config.timeRange.timezone),
+        getEDTTimestamp(year, month, day, 23, 59),
         now
       );
       
