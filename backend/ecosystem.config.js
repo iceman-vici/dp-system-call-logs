@@ -3,7 +3,7 @@ module.exports = {
     {
       name: 'dialpad-sync-cron',
       script: './src/sync/sync.js',
-      cwd: '/path/to/your/dp-system-call-logs/backend', // UPDATE THIS PATH
+      cwd: '/var/www/dp-system-call-logs/backend', // UPDATE THIS PATH
       instances: 1,
       autorestart: false,
       watch: false,
@@ -11,7 +11,7 @@ module.exports = {
       env: {
         NODE_ENV: 'production'
       },
-      cron_restart: '* * * * *', // Runs every minute for testing
+      cron_restart: '* 8-18 * * *', // Runs every minute for testing
       // Production cron patterns:
       // '0 7 * * *' - Daily at 7 AM
       // '*/15 * * * *' - Every 15 minutes
