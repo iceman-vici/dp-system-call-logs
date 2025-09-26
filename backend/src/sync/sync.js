@@ -34,6 +34,12 @@ const config = {
     pageSize: Math.min(parseInt(process.env.PAGE_SIZE || '50'), 50), // Enforce max 50
     displayTimezone: process.env.DISPLAY_TIMEZONE || 'America/New_York',
     realtimeOnly: process.env.REALTIME_ONLY === 'true' // New flag for real-time only mode
+  },
+  businessHours: {
+    enabled: process.env.BUSINESS_HOURS_ENABLED === 'true',
+    startHour: parseInt(process.env.BUSINESS_HOURS_START || '9'), // 9 AM
+    endHour: parseInt(process.env.BUSINESS_HOURS_END || '18'), // 6 PM (18:00)
+    timezone: process.env.BUSINESS_HOURS_TIMEZONE || 'America/New_York'
   }
 };
 
@@ -57,6 +63,19 @@ function validateConfig() {
     config.sync.pageSize = 50;
   }
   
+  // Validate business hours
+  if (config.businessHours.enabled) {
+    if (config.businessHours.startHour < 0 || config.businessHours.startHour > 23) {
+      throw new Error('BUSINESS_HOURS_START must be between 0 and 23');
+    }
+    if (config.businessHours.endHour < 1 || config.businessHours.endHour > 24) {
+      throw new Error('BUSINESS_HOURS_END must be between 1 and 24');
+    }
+    if (config.businessHours.startHour >= config.businessHours.endHour) {
+      throw new Error('BUSINESS_HOURS_END must be after BUSINESS_HOURS_START');
+    }
+  }
+  
   logger.info('Configuration validated successfully');
   logger.debug({
     dialpadConfigured: !!config.dialpad.apiKey,
@@ -64,8 +83,48 @@ function validateConfig() {
     daysBack: config.sync.daysBack,
     pageSize: config.sync.pageSize,
     displayTimezone: config.sync.displayTimezone,
-    realtimeOnly: config.sync.realtimeOnly
+    realtimeOnly: config.sync.realtimeOnly,
+    businessHours: config.businessHours
   }, 'Config details');
+}
+
+// Get start of business hours for today in milliseconds
+function getBusinessHoursWindow() {
+  const now = new Date();
+  
+  // Create date in business hours timezone
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: config.businessHours.timezone,
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: 'numeric',
+    hour12: false
+  });
+  
+  const parts = formatter.formatToParts(now);
+  const year = parts.find(p => p.type === 'year').value;
+  const month = parts.find(p => p.type === 'month').value;
+  const day = parts.find(p => p.type === 'day').value;
+  const currentHour = parseInt(parts.find(p => p.type === 'hour').value);
+  
+  // Create start and end times for business hours in the specified timezone
+  const startDate = new Date(`${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${config.businessHours.startHour.toString().padStart(2, '0')}:00:00`);
+  const endDate = new Date(`${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${config.businessHours.endHour.toString().padStart(2, '0')}:00:00`);
+  
+  // Convert to UTC timestamps
+  // Note: This is a simplified conversion. For production, consider using a library like date-fns-tz
+  const tzOffset = now.getTimezoneOffset() * 60 * 1000;
+  const startTimestamp = startDate.getTime() - tzOffset;
+  const endTimestamp = Math.min(endDate.getTime() - tzOffset, Date.now()); // Don't go into the future
+  
+  return {
+    start: startTimestamp,
+    end: endTimestamp,
+    currentHour,
+    isWithinBusinessHours: currentHour >= config.businessHours.startHour && currentHour < config.businessHours.endHour
+  };
 }
 
 // Get start of current day in milliseconds
@@ -280,6 +339,27 @@ function formatDuration(ms) {
   return Math.floor((ms || 0) / 1000);
 }
 
+// Check if a call is within business hours
+function isWithinBusinessHours(callTimestamp) {
+  if (!config.businessHours.enabled) {
+    return true; // If business hours filtering is disabled, include all calls
+  }
+  
+  const callDate = new Date(callTimestamp);
+  const callHour = callDate.getHours(); // This is in local timezone
+  
+  // Convert to business timezone hour
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: config.businessHours.timezone,
+    hour: 'numeric',
+    hour12: false
+  });
+  
+  const businessHour = parseInt(formatter.format(callDate));
+  
+  return businessHour >= config.businessHours.startHour && businessHour < config.businessHours.endHour;
+}
+
 // Main sync function
 async function sync() {
   logger.info('Starting sync...');
@@ -318,17 +398,43 @@ async function sync() {
     const backfillGraceMs = config.sync.backfillGraceSeconds * 1000;
     
     let startedAfter;
+    let startedBefore = now;
     
     if (config.sync.realtimeOnly || config.sync.daysBack === 0) {
-      // Real-time mode: only sync from today or last sync time
-      if (lastSyncedMs > 0) {
-        // If we've synced before, start from last sync with small grace period
-        startedAfter = lastSyncedMs - backfillGraceMs;
-        logger.info('Real-time mode: Syncing from last sync time');
+      // Real-time mode with business hours
+      if (config.businessHours.enabled) {
+        const businessWindow = getBusinessHoursWindow();
+        
+        if (lastSyncedMs > 0) {
+          // If we've synced before, start from last sync or business hours start, whichever is later
+          startedAfter = Math.max(businessWindow.start, lastSyncedMs - backfillGraceMs);
+        } else {
+          // First sync: start from beginning of business hours today
+          startedAfter = businessWindow.start;
+        }
+        
+        // Don't sync beyond business hours
+        startedBefore = Math.min(businessWindow.end, now);
+        
+        logger.info({
+          businessHours: `${config.businessHours.startHour}:00 - ${config.businessHours.endHour}:00 ${config.businessHours.timezone}`,
+          isWithinBusinessHours: businessWindow.isWithinBusinessHours,
+          currentHour: businessWindow.currentHour
+        }, 'Business hours configuration');
+        
+        // Check if we're outside business hours
+        if (!businessWindow.isWithinBusinessHours) {
+          logger.info('Currently outside business hours, will only sync calls from business hours');
+        }
       } else {
-        // First sync: start from beginning of today
-        startedAfter = getStartOfToday();
-        logger.info('Real-time mode: First sync - starting from today');
+        // No business hours restriction
+        if (lastSyncedMs > 0) {
+          startedAfter = lastSyncedMs - backfillGraceMs;
+          logger.info('Real-time mode: Syncing from last sync time');
+        } else {
+          startedAfter = getStartOfToday();
+          logger.info('Real-time mode: First sync - starting from today');
+        }
       }
     } else {
       // Historical mode: sync from X days back
@@ -340,10 +446,9 @@ async function sync() {
       logger.info(`Historical mode: Syncing from ${config.sync.daysBack} days back`);
     }
     
-    const startedBefore = now;
-    
     logger.info({
       mode: config.sync.realtimeOnly ? 'Real-time' : 'Historical',
+      businessHoursEnabled: config.businessHours.enabled,
       lastSynced: lastSyncedMs > 0 ? new Date(lastSyncedMs).toISOString() : 'Never',
       startedAfter: new Date(startedAfter).toISOString(),
       startedBefore: new Date(startedBefore).toISOString(),
@@ -354,6 +459,7 @@ async function sync() {
     let cursor = null;
     let totalCalls = 0;
     let matchedCalls = 0;
+    let filteredOutCalls = 0;
     let pageCount = 0;
     const maxPages = 200; // Safety limit (200 pages * 50 records = 10,000 calls max)
 
@@ -392,6 +498,14 @@ async function sync() {
         // Parse call data based on actual Dialpad API structure
         const callId = call.id || call.call_id || `${call.date_started}_${call.external_number}`;
         const startTime = parseInt(call.date_started); // Already in milliseconds
+        
+        // Filter by business hours if enabled
+        if (config.businessHours.enabled && !isWithinBusinessHours(startTime)) {
+          filteredOutCalls++;
+          logger.debug(`Call ${callId} filtered out - outside business hours`);
+          continue;
+        }
+        
         const endTime = call.date_ended ? parseInt(call.date_ended) : null;
         const duration = formatDuration(call.duration); // Convert to seconds
         const externalNumber = call.external_number;
@@ -479,6 +593,7 @@ async function sync() {
         progress: {
           pagesProcessed: pageCount,
           totalCallsProcessed: totalCalls,
+          filteredOut: filteredOutCalls,
           matchedSoFar: matchedCalls,
           hasMore: !!cursor
         }
@@ -487,13 +602,14 @@ async function sync() {
     } while (cursor);
 
     // Final summary
-    if (totalCalls === 0) {
+    if (totalCalls === 0 && filteredOutCalls === 0) {
       logger.info('No new calls to sync for the specified time period');
     } else {
       logger.info({
         totalCalls,
         matchedCalls,
         unmatchedCalls: totalCalls - matchedCalls,
+        filteredOutByBusinessHours: filteredOutCalls,
         matchRate: totalCalls > 0 ? (matchedCalls / totalCalls * 100).toFixed(2) + '%' : 'N/A',
         pagesProcessed: pageCount
       }, 'Sync completed successfully');
@@ -504,6 +620,7 @@ async function sync() {
       totalCalls,
       matchedCalls,
       unmatchedCalls: totalCalls - matchedCalls,
+      filteredOutCalls,
       pagesProcessed: pageCount
     };
 
