@@ -28,11 +28,11 @@ const config = {
     callsUnmatchedPhone: process.env.CALLS_UNMATCHED_PHONE_FIELD
   },
   sync: {
-    daysBack: parseInt(process.env.DAYS_BACK || '7'), // Reduced to 7 days
-    backfillGraceSeconds: parseInt(process.env.BACKFILL_GRACE_SECONDS || '3600'), // 1 hour
+    daysBack: parseInt(process.env.DAYS_BACK || '7'),
+    backfillGraceSeconds: parseInt(process.env.BACKFILL_GRACE_SECONDS || '3600'),
     defaultRegion: process.env.DEFAULT_REGION || 'SG',
-    pageSize: parseInt(process.env.PAGE_SIZE || '50'), // Reduced page size
-    displayTimezone: process.env.DISPLAY_TIMEZONE || 'America/New_York' // For display in Airtable
+    pageSize: Math.min(parseInt(process.env.PAGE_SIZE || '50'), 50), // Enforce max 50
+    displayTimezone: process.env.DISPLAY_TIMEZONE || 'America/New_York'
   }
 };
 
@@ -50,6 +50,12 @@ function validateConfig() {
     throw new Error(`Missing required environment variables: ${missing.join(', ')}`);
   }
   
+  // Ensure page size doesn't exceed 50
+  if (config.sync.pageSize > 50) {
+    logger.warn('PAGE_SIZE exceeds Dialpad API limit of 50, setting to 50');
+    config.sync.pageSize = 50;
+  }
+  
   logger.info('Configuration validated successfully');
   logger.debug({
     dialpadConfigured: !!config.dialpad.apiKey,
@@ -60,46 +66,7 @@ function validateConfig() {
   }, 'Config details');
 }
 
-// Convert UTC timestamp to EDT/EST string for Airtable
-function formatDateForAirtable(timestamp) {
-  if (!timestamp) return null;
-  
-  const date = new Date(timestamp);
-  
-  // Option 1: Store as ISO string (Airtable will display based on field settings)
-  // return date.toISOString();
-  
-  // Option 2: Store with timezone offset information
-  // This helps Airtable understand the timezone better
-  const options = {
-    timeZone: config.sync.displayTimezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: false
-  };
-  
-  // Get the date in EDT/EST
-  const formatter = new Intl.DateTimeFormat('en-US', options);
-  const parts = formatter.formatToParts(date);
-  
-  // Reconstruct in ISO-like format that Airtable understands
-  const year = parts.find(p => p.type === 'year').value;
-  const month = parts.find(p => p.type === 'month').value;
-  const day = parts.find(p => p.type === 'day').value;
-  const hour = parts.find(p => p.type === 'hour').value;
-  const minute = parts.find(p => p.type === 'minute').value;
-  const second = parts.find(p => p.type === 'second').value;
-  
-  // Return ISO format - Airtable will interpret based on field settings
-  // If field is set to specific timezone, it will display correctly
-  return `${year}-${month}-${day}T${hour}:${minute}:${second}.000Z`;
-}
-
-// Dialpad API client - Updated to match actual API
+// Dialpad API client
 class DialpadClient {
   constructor() {
     this.axios = axios.create({
@@ -144,8 +111,8 @@ class DialpadClient {
       if (error.response?.status === 401) {
         throw new Error('Invalid Dialpad API key. Please check your credentials.');
       } else if (error.response?.status === 400) {
-        // Try alternate endpoint format
-        logger.info('Trying alternate API format...');
+        const errorMessage = error.response?.data?.error?.message || error.message;
+        throw new Error(`Dialpad API error: ${errorMessage}`);
       }
       throw error;
     }
@@ -153,9 +120,9 @@ class DialpadClient {
 
   async getCalls(startedAfter, startedBefore, cursor = null) {
     const params = {
-      started_after: Math.floor(startedAfter), // Ensure it's an integer
-      started_before: Math.floor(startedBefore), // Ensure it's an integer
-      limit: config.sync.pageSize
+      started_after: Math.floor(startedAfter),
+      started_before: Math.floor(startedBefore),
+      limit: config.sync.pageSize // Already capped at 50
     };
     
     if (cursor) {
@@ -165,31 +132,37 @@ class DialpadClient {
     logger.info({
       startedAfter: new Date(startedAfter).toISOString(),
       startedBefore: new Date(startedBefore).toISOString(),
-      limit: params.limit
+      limit: params.limit,
+      cursor: cursor ? 'present' : 'none'
     }, 'Fetching calls from Dialpad');
 
     try {
       const response = await this.axios.get('/api/v2/call', { params });
       
       const items = response.data.items || [];
-      logger.info(`Retrieved ${items.length} calls from Dialpad`);
+      const nextCursor = response.data.cursor || null;
+      
+      logger.info({
+        retrieved: items.length,
+        hasMore: !!nextCursor
+      }, 'Retrieved calls from Dialpad');
       
       return {
         items,
-        cursor: response.data.cursor || null
+        cursor: nextCursor
       };
     } catch (error) {
       if (error.response?.status === 400) {
-        logger.error('Bad request to Dialpad API. This might be due to:');
-        logger.error('1. Date range is too large (try reducing DAYS_BACK)');
-        logger.error('2. Invalid timestamp format');
-        logger.error('3. API endpoint has changed');
+        const errorMessage = error.response?.data?.error?.message || 'Bad request';
+        logger.error(`Dialpad API 400 error: ${errorMessage}`);
         
         // Log the actual request for debugging
         logger.error({
           url: error.config?.url,
           params: error.config?.params
         }, 'Failed request details');
+        
+        throw new Error(`Dialpad API error: ${errorMessage}`);
       }
       throw error;
     }
@@ -298,7 +271,7 @@ function formatDuration(ms) {
   return Math.floor((ms || 0) / 1000);
 }
 
-// Main sync function - Updated to match Dialpad API v2
+// Main sync function
 async function sync() {
   logger.info('Starting sync...');
   
@@ -350,12 +323,12 @@ async function sync() {
       daysBack: config.sync.daysBack
     }, 'Sync window determined');
 
-    // Fetch and process calls
+    // Fetch and process calls with pagination
     let cursor = null;
     let totalCalls = 0;
     let matchedCalls = 0;
     let pageCount = 0;
-    const maxPages = 100; // Safety limit
+    const maxPages = 200; // Safety limit (200 pages * 50 records = 10,000 calls max)
 
     do {
       pageCount++;
@@ -367,11 +340,16 @@ async function sync() {
         calls = result.items;
         nextCursor = result.cursor;
       } catch (error) {
-        logger.error(`Failed to fetch page ${pageCount}:`, error.message);
-        break;
+        logger.error(`Failed to fetch page ${pageCount}: ${error.message}`);
+        // If we've already processed some pages, continue with what we have
+        if (pageCount > 1) {
+          logger.info('Continuing with already fetched data...');
+          break;
+        }
+        throw error; // If first page fails, throw the error
       }
       
-      if (calls.length === 0) {
+      if (!calls || calls.length === 0) {
         logger.info('No more calls to process');
         break;
       }
@@ -399,7 +377,7 @@ async function sync() {
           // Use ISO format - Airtable will handle timezone display based on field settings
           'Start Time': new Date(startTime).toISOString(),
           'End Time': endTime ? new Date(endTime).toISOString() : null,
-          // Alternative: Add separate fields for EDT display
+          // Optional: Add separate field for EDT display (you can add this field in Airtable)
           'Start Time (EDT)': new Date(startTime).toLocaleString('en-US', { 
             timeZone: 'America/New_York',
             year: 'numeric',
@@ -441,21 +419,40 @@ async function sync() {
         logger.info(`Upserting ${callsToUpsert.length} calls to Airtable...`);
         try {
           await airtable.upsertCalls(callsToUpsert);
+          logger.info(`Successfully upserted ${callsToUpsert.length} calls`);
         } catch (error) {
           logger.error('Failed to upsert calls to Airtable:', error.message);
+          // Continue processing even if Airtable update fails
         }
       }
 
       // Update state after each page
       await state.setLastSynced(Math.floor(now / 1000)); // Save as seconds
       
+      // Update cursor for next iteration
       cursor = nextCursor;
+      
+      // Add small delay to avoid rate limiting
+      if (cursor) {
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 1 second delay between pages
+      }
       
       // Safety check
       if (pageCount >= maxPages) {
         logger.warn(`Reached maximum page limit (${maxPages}), stopping sync`);
         break;
       }
+      
+      // Log progress
+      logger.info({
+        progress: {
+          pagesProcessed: pageCount,
+          totalCallsProcessed: totalCalls,
+          matchedSoFar: matchedCalls,
+          hasMore: !!cursor
+        }
+      }, 'Page processing complete');
+      
     } while (cursor);
 
     logger.info({
@@ -483,7 +480,10 @@ async function sync() {
 // Run if called directly
 if (require.main === module) {
   sync()
-    .then(() => process.exit(0))
+    .then((result) => {
+      logger.info(result, 'Sync completed');
+      process.exit(0);
+    })
     .catch((error) => {
       logger.fatal(error, 'Fatal error during sync');
       process.exit(1);
