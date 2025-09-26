@@ -7,6 +7,7 @@ const { createServer } = require('http');
 const { Server } = require('socket.io');
 const pino = require('pino');
 const cron = require('node-cron');
+const path = require('path');
 
 // Import routes
 const syncRoutes = require('./api/routes/sync.routes');
@@ -22,12 +23,12 @@ const SyncEngine = require('./sync/engine');
 // Initialize logger
 const logger = pino({
   level: process.env.LOG_LEVEL || 'info',
-  transport: {
+  transport: process.env.NODE_ENV !== 'production' ? {
     target: 'pino-pretty',
     options: {
       colorize: true
     }
-  }
+  } : undefined
 });
 
 // Initialize Express

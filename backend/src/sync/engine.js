@@ -1,4 +1,3 @@
-const sync = require('./sync');
 const state = require('./state');
 
 class SyncEngine {
@@ -20,12 +19,17 @@ class SyncEngine {
     const startTime = Date.now();
 
     // Emit sync started event
-    this.io.to('sync-updates').emit('sync:started', {
-      timestamp: new Date().toISOString()
-    });
+    if (this.io) {
+      this.io.to('sync-updates').emit('sync:started', {
+        timestamp: new Date().toISOString()
+      });
+    }
 
     try {
       this.logger.info('Starting sync engine...');
+      
+      // Dynamically require sync to avoid circular dependencies
+      const sync = require('./sync');
       
       // Run the sync
       const result = await sync();
@@ -46,7 +50,9 @@ class SyncEngine {
       }
 
       // Emit sync completed event
-      this.io.to('sync-updates').emit('sync:completed', this.lastSyncResult);
+      if (this.io) {
+        this.io.to('sync-updates').emit('sync:completed', this.lastSyncResult);
+      }
       
       this.logger.info({ result, duration }, 'Sync completed');
       return this.lastSyncResult;
@@ -65,7 +71,9 @@ class SyncEngine {
       this.syncHistory.unshift(errorResult);
       
       // Emit sync failed event
-      this.io.to('sync-updates').emit('sync:failed', errorResult);
+      if (this.io) {
+        this.io.to('sync-updates').emit('sync:failed', errorResult);
+      }
       
       throw error;
       
